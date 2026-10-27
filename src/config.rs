@@ -44,7 +44,8 @@ struct FileConfig {
     pub codex: Option<CodexConfig>,
     pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
-    pub opencode: Option<OpenCodeConfig>,
+    pub opencode: Option<GatewayFileConfig>,
+    pub commandcode: Option<GatewayFileConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -109,11 +110,13 @@ struct GrokConfig {
 }
 
 #[derive(Deserialize, Clone)]
-struct OpenCodeConfig {
+struct GatewayFileConfig {
     #[serde(rename = "apiKey")]
     pub api_key: Option<String>,
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,
+    #[serde(rename = "modelsFile")]
+    pub models_file: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -300,6 +303,17 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_OPENCODE_BASE_URL") {
         out.push("opencode.baseUrl (env)".to_string());
     }
+    if env.contains_key("CCP_COMMANDCODE_API_KEY") {
+        out.push("commandcode.apiKey (env)".to_string());
+    } else if env.contains_key("CMD_API_KEY") {
+        out.push("commandcode.apiKey (Command Code env)".to_string());
+    }
+    if env.contains_key("CCP_COMMANDCODE_BASE_URL") {
+        out.push("commandcode.baseUrl (env)".to_string());
+    }
+    if let Some(path) = env.get("CCP_COMMANDCODE_MODELS_FILE") {
+        out.push(format!("commandcode.modelsFile (env): {path}"));
+    }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .is_some_and(|raw| !raw.is_empty())
@@ -345,6 +359,17 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(url) = opencode.base_url.filter(|raw| !raw.is_empty()) {
                 out.push(format!("opencode.baseUrl: {url}"));
+            }
+        }
+        if let Some(commandcode) = file_cfg.commandcode {
+            if commandcode.api_key.is_some_and(|raw| !raw.is_empty()) {
+                out.push("commandcode.apiKey (config)".to_string());
+            }
+            if let Some(url) = commandcode.base_url.filter(|raw| !raw.is_empty()) {
+                out.push(format!("commandcode.baseUrl: {url}"));
+            }
+            if let Some(path) = commandcode.models_file.filter(|raw| !raw.is_empty()) {
+                out.push(format!("commandcode.modelsFile: {path}"));
             }
         }
         if let Some(codex) = file_cfg.codex {
@@ -512,53 +537,74 @@ pub fn grok_search_blocks() -> GrokSearchBlocks {
     parse_grok_search_blocks(std::env::var("CCP_GROK_SEARCH_BLOCKS").ok().as_deref())
 }
 
-struct ResolvedOpenCodeConfig {
+/// Where one OpenAI/Anthropic-compatible gateway reads its key and base URL:
+/// key variables in precedence order, then config.json, then nothing.
+struct GatewayEnv {
+    key_vars: &'static [&'static str],
+    base_url_var: &'static str,
+    default_base_url: &'static str,
+}
+
+const OPENCODE_ENV: GatewayEnv = GatewayEnv {
+    key_vars: &["CCP_OPENCODE_API_KEY", "OPENCODE_API_KEY"],
+    base_url_var: "CCP_OPENCODE_BASE_URL",
+    default_base_url: "https://opencode.ai/zen/go/v1",
+};
+
+const COMMANDCODE_ENV: GatewayEnv = GatewayEnv {
+    key_vars: &["CCP_COMMANDCODE_API_KEY", "CMD_API_KEY"],
+    base_url_var: "CCP_COMMANDCODE_BASE_URL",
+    default_base_url: "https://api.commandcode.ai/provider/v1",
+};
+
+struct ResolvedGatewayConfig {
     api_key: Option<String>,
     api_key_source: Option<&'static str>,
     base_url: String,
 }
 
-fn resolve_opencode_config(
+fn resolve_gateway_config(
     env: &HashMap<String, String>,
-    config_dir: &Path,
-) -> ResolvedOpenCodeConfig {
-    let file = read_file_config(config_dir).and_then(|file| file.opencode);
+    file: Option<&GatewayFileConfig>,
+    spec: &GatewayEnv,
+) -> ResolvedGatewayConfig {
     let file_key = file
-        .as_ref()
         .and_then(|config| config.api_key.as_ref())
         .filter(|value| !value.is_empty());
-    let (api_key, api_key_source) = if let Some(value) = env
-        .get("CCP_OPENCODE_API_KEY")
-        .filter(|value| !value.is_empty())
-    {
-        (Some(value.clone()), Some("CCP_OPENCODE_API_KEY"))
-    } else if let Some(value) = env
-        .get("OPENCODE_API_KEY")
-        .filter(|value| !value.is_empty())
-    {
-        (Some(value.clone()), Some("OPENCODE_API_KEY"))
-    } else if let Some(value) = file_key {
-        (Some(value.clone()), Some("config.json"))
-    } else {
-        (None, None)
-    };
+    let (api_key, api_key_source) = spec
+        .key_vars
+        .iter()
+        .find_map(|name| {
+            env.get(*name)
+                .filter(|value| !value.is_empty())
+                .map(|value| (Some(value.clone()), Some(*name)))
+        })
+        .or_else(|| file_key.map(|value| (Some(value.clone()), Some("config.json"))))
+        .unwrap_or((None, None));
     let base_url = env
-        .get("CCP_OPENCODE_BASE_URL")
+        .get(spec.base_url_var)
         .filter(|value| !value.is_empty())
         .cloned()
         .or_else(|| {
-            file.as_ref()
-                .and_then(|config| config.base_url.as_ref())
+            file.and_then(|config| config.base_url.as_ref())
                 .filter(|value| !value.is_empty())
                 .cloned()
         })
-        .unwrap_or_else(|| "https://opencode.ai/zen/go/v1".to_string());
+        .unwrap_or_else(|| spec.default_base_url.to_string());
 
-    ResolvedOpenCodeConfig {
+    ResolvedGatewayConfig {
         api_key,
         api_key_source,
         base_url,
     }
+}
+
+fn resolve_opencode_config(
+    env: &HashMap<String, String>,
+    config_dir: &Path,
+) -> ResolvedGatewayConfig {
+    let file = read_file_config(config_dir).and_then(|file| file.opencode);
+    resolve_gateway_config(env, file.as_ref(), &OPENCODE_ENV)
 }
 
 pub fn opencode_api_key() -> Option<String> {
@@ -574,6 +620,55 @@ pub fn opencode_api_key_source() -> Option<&'static str> {
 pub fn opencode_base_url() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     resolve_opencode_config(&env, &paths::config_dir()).base_url
+}
+
+fn resolve_commandcode_config(
+    env: &HashMap<String, String>,
+    config_dir: &Path,
+) -> (ResolvedGatewayConfig, Option<String>) {
+    let file = read_file_config(config_dir).and_then(|file| file.commandcode);
+    let models_file = env
+        .get("CCP_COMMANDCODE_MODELS_FILE")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .or_else(|| {
+            file.as_ref()
+                .and_then(|config| config.models_file.as_ref())
+                .filter(|value| !value.is_empty())
+                .cloned()
+        });
+    (
+        resolve_gateway_config(env, file.as_ref(), &COMMANDCODE_ENV),
+        models_file,
+    )
+}
+
+pub fn commandcode_api_key() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_commandcode_config(&env, &paths::config_dir())
+        .0
+        .api_key
+}
+
+pub fn commandcode_api_key_source() -> Option<&'static str> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_commandcode_config(&env, &paths::config_dir())
+        .0
+        .api_key_source
+}
+
+pub fn commandcode_base_url() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_commandcode_config(&env, &paths::config_dir())
+        .0
+        .base_url
+}
+
+/// JSON list of `{"id", "endpoint"}` entries naming the Command Code models
+/// this proxy routes. Without it the Command Code lane advertises nothing.
+pub fn commandcode_models_file() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_commandcode_config(&env, &paths::config_dir()).1
 }
 
 pub fn is_verbose() -> bool {
@@ -1133,6 +1228,40 @@ mod tests {
         assert_eq!(resolved.api_key.as_deref(), Some("ccp-key"));
         assert_eq!(resolved.api_key_source, Some("CCP_OPENCODE_API_KEY"));
         assert_eq!(resolved.base_url, "https://env.example/v1");
+    }
+
+    #[test]
+    fn commandcode_config_reads_file_and_env_precedence() {
+        let config = tempfile::TempDir::new().unwrap();
+        let mut env = HashMap::new();
+        let (resolved, models_file) = resolve_commandcode_config(&env, config.path());
+        assert_eq!(resolved.api_key, None);
+        assert_eq!(resolved.base_url, "https://api.commandcode.ai/provider/v1");
+        assert_eq!(models_file, None);
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"commandcode":{"apiKey":"file-key","modelsFile":"/file/models.json"}}"#,
+        )
+        .unwrap();
+        let (resolved, models_file) = resolve_commandcode_config(&env, config.path());
+        assert_eq!(resolved.api_key.as_deref(), Some("file-key"));
+        assert_eq!(resolved.api_key_source, Some("config.json"));
+        assert_eq!(models_file.as_deref(), Some("/file/models.json"));
+
+        env.insert("CMD_API_KEY".into(), "standard-key".into());
+        let (resolved, _) = resolve_commandcode_config(&env, config.path());
+        assert_eq!(resolved.api_key_source, Some("CMD_API_KEY"));
+
+        env.insert("CCP_COMMANDCODE_API_KEY".into(), "ccp-key".into());
+        env.insert(
+            "CCP_COMMANDCODE_MODELS_FILE".into(),
+            "/env/models.json".into(),
+        );
+        let (resolved, models_file) = resolve_commandcode_config(&env, config.path());
+        assert_eq!(resolved.api_key.as_deref(), Some("ccp-key"));
+        assert_eq!(resolved.api_key_source, Some("CCP_COMMANDCODE_API_KEY"));
+        assert_eq!(models_file.as_deref(), Some("/env/models.json"));
     }
 
     #[test]

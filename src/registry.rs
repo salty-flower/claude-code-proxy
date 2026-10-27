@@ -85,10 +85,15 @@ impl Registry {
             "opencode".into(),
             crate::providers::opencode::advertised_models(),
         );
+        // Its catalog is loaded at runtime, so the provider instance is the
+        // source of its model list.
+        let commandcode = Arc::new(crate::providers::commandcode::provider());
+        models.insert("commandcode".into(), commandcode.supported_models());
 
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
             let handler: Arc<dyn Provider> = match name.as_str() {
+                "commandcode" => commandcode.clone(),
                 "codex" => Arc::new(crate::providers::codex::CodexProvider::new()),
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
