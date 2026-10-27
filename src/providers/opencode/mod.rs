@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod client;
+pub mod gateway;
 pub mod messages;
 pub mod model;
 pub mod responses;
@@ -25,32 +26,76 @@ use crate::provider::{
 use crate::providers::kimi::count_tokens;
 
 use self::client::{OpenCodeClient, OpenCodeError};
-use self::model::EndpointKind;
+use self::gateway::{Gateway, OPENCODE_GO};
+use self::model::{EndpointKind, ModelCatalog, OpenCodeGoCatalog};
 
 enum ClientState {
     Ready(Arc<OpenCodeClient>),
     Invalid(String),
 }
 
+/// A provider for any gateway that serves Anthropic Messages, OpenAI Chat
+/// Completions, and OpenAI Responses behind one base URL and one API key.
+/// OpenCode Go is the original instance; others differ only in their
+/// [`Gateway`] descriptor and model catalog.
 pub struct OpenCodeProvider {
+    gateway: &'static Gateway,
+    catalog: Arc<dyn ModelCatalog>,
+    cli: &'static dyn CliHandlers,
     client: ClientState,
 }
 
 impl OpenCodeProvider {
     pub fn new() -> Self {
-        let client = OpenCodeClient::new(
+        Self::for_gateway(
+            &OPENCODE_GO,
+            Arc::new(OpenCodeGoCatalog),
+            &OPENCODE_CLI,
             crate::config::opencode_base_url(),
             crate::config::opencode_api_key(),
         )
-        .map(Arc::new)
-        .map(ClientState::Ready)
-        .unwrap_or_else(|error| ClientState::Invalid(error.to_string()));
-        Self { client }
+    }
+
+    pub fn for_gateway(
+        gateway: &'static Gateway,
+        catalog: Arc<dyn ModelCatalog>,
+        cli: &'static dyn CliHandlers,
+        base_url: String,
+        api_key: Option<String>,
+    ) -> Self {
+        let client = OpenCodeClient::for_gateway(gateway, base_url, api_key)
+            .map(Arc::new)
+            .map(ClientState::Ready)
+            .unwrap_or_else(|error| ClientState::Invalid(error.to_string()));
+        Self {
+            gateway,
+            catalog,
+            cli,
+            client,
+        }
     }
 
     #[cfg(test)]
     fn with_client(client: OpenCodeClient) -> Self {
         Self {
+            gateway: &OPENCODE_GO,
+            catalog: Arc::new(OpenCodeGoCatalog),
+            cli: &OPENCODE_CLI,
+            client: ClientState::Ready(Arc::new(client)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_gateway_client(
+        gateway: &'static Gateway,
+        catalog: Arc<dyn ModelCatalog>,
+        cli: &'static dyn CliHandlers,
+        client: OpenCodeClient,
+    ) -> Self {
+        Self {
+            gateway,
+            catalog,
+            cli,
             client: ClientState::Ready(Arc::new(client)),
         }
     }
@@ -68,21 +113,21 @@ impl OpenCodeProvider {
         ctx: RequestContext,
     ) -> Response {
         let requested = body.model.as_deref().unwrap_or_default();
-        let Some(spec) = model::resolve(requested) else {
-            return unsupported_model(requested);
+        let Some(spec) = self.catalog.resolve(requested) else {
+            return unsupported_model(self.gateway, requested);
         };
         if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, spec.id);
+            monitor.model_resolved(&ctx.req_id, &spec.id);
         }
         let client = match self.client() {
             Ok(client) => client,
-            Err(error) => return invalid_configuration_response(error),
+            Err(error) => return invalid_configuration_response(self.gateway, error),
         };
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
         let value = match spec.endpoint {
             EndpointKind::ChatCompletions => {
-                let translated = match chat::prepare_request(&body, spec.id) {
+                let translated = match chat::prepare_request(&body, &spec.id) {
                     Ok(translated) => translated,
                     Err(error) => return invalid_request_response(error),
                 };
@@ -107,11 +152,11 @@ impl OpenCodeProvider {
                 capture_buffered_upstream(&ctx, &bytes, "sse");
                 match chat::accumulate_response(&bytes, &message_id, requested) {
                     Ok(value) => value,
-                    Err(error) => return invalid_upstream_response(error),
+                    Err(error) => return invalid_upstream_response(self.gateway, error),
                 }
             }
             EndpointKind::Messages => {
-                let translated = match messages::prepare_request(&body, spec.id) {
+                let translated = match messages::prepare_request(&body, &spec.id) {
                     Ok(translated) => translated,
                     Err(error) => return invalid_request_response(error),
                 };
@@ -136,12 +181,12 @@ impl OpenCodeProvider {
                 capture_buffered_upstream(&ctx, &bytes, "json");
                 match serde_json::from_slice::<serde_json::Value>(&bytes) {
                     Ok(value) => value,
-                    Err(error) => return invalid_upstream_response(error),
+                    Err(error) => return invalid_upstream_response(self.gateway, error),
                 }
             }
             EndpointKind::Responses => {
                 let translated =
-                    match responses::prepare_request(&body, spec.id, ctx.session_id.clone()) {
+                    match responses::prepare_request(&body, &spec.id, ctx.session_id.clone()) {
                         Ok(translated) => translated,
                         Err(error) => return invalid_request_response(error),
                     };
@@ -166,7 +211,7 @@ impl OpenCodeProvider {
                 capture_buffered_upstream(&ctx, &bytes, "sse");
                 match responses::accumulate_response(&bytes, &message_id, requested) {
                     Ok(value) => value,
-                    Err(error) => return invalid_upstream_response(error),
+                    Err(error) => return invalid_upstream_response(self.gateway, error),
                 }
             }
         };
@@ -192,15 +237,15 @@ pub fn advertised_models() -> Vec<String> {
 #[async_trait]
 impl Provider for OpenCodeProvider {
     fn name(&self) -> &'static str {
-        "opencode"
+        self.gateway.provider
     }
 
     fn supported_models(&self) -> Vec<String> {
-        advertised_models()
+        self.catalog.advertised_models()
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
-        &OPENCODE_CLI
+        self.cli
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -215,11 +260,11 @@ impl Provider for OpenCodeProvider {
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let requested = body.model.as_deref().unwrap_or_default();
-        let Some(spec) = model::resolve(requested) else {
-            return unsupported_model(requested);
+        let Some(spec) = self.catalog.resolve(requested) else {
+            return unsupported_model(self.gateway, requested);
         };
         if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, spec.id);
+            monitor.model_resolved(&ctx.req_id, &spec.id);
         }
         let tokens = count_tokens::count_tokens(&body);
         if let Some(monitor) = ctx.monitor.as_ref() {
@@ -241,29 +286,30 @@ impl Provider for OpenCodeProvider {
     ) -> Result<Generation, ProviderError> {
         body.stream = true;
         let requested = body.model.as_deref().unwrap_or_default();
-        let spec = model::resolve(requested).ok_or_else(|| {
+        let label = self.gateway.label;
+        let spec = self.catalog.resolve(requested).ok_or_else(|| {
             ProviderError::new(
                 StatusCode::BAD_REQUEST,
                 ProviderErrorKind::InvalidRequest,
-                format!("Unsupported OpenCode Go model: {requested}"),
+                format!("Unsupported {label} model: {requested}"),
             )
         })?;
         let client = self.client().map_err(|error| {
             ProviderError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ProviderErrorKind::Api,
-                format!("Invalid OpenCode Go configuration: {error}"),
+                format!("Invalid {label} configuration: {error}"),
             )
         })?;
 
         if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, spec.id);
+            monitor.model_resolved(&ctx.req_id, &spec.id);
             monitor.upstream_started(&ctx.req_id);
         }
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let body = match spec.endpoint {
             EndpointKind::ChatCompletions => {
-                let translated = chat::prepare_request(&body, spec.id)
+                let translated = chat::prepare_request(&body, &spec.id)
                     .map_err(invalid_request_provider_error)?;
                 let upstream = client
                     .post(
@@ -285,7 +331,7 @@ impl Provider for OpenCodeProvider {
                 )
             }
             EndpointKind::Messages => {
-                let translated = messages::prepare_request(&body, spec.id)
+                let translated = messages::prepare_request(&body, &spec.id)
                     .map_err(invalid_request_provider_error)?;
                 let upstream = client
                     .post(
@@ -305,8 +351,9 @@ impl Provider for OpenCodeProvider {
                 )
             }
             EndpointKind::Responses => {
-                let translated = responses::prepare_request(&body, spec.id, ctx.session_id.clone())
-                    .map_err(invalid_request_provider_error)?;
+                let translated =
+                    responses::prepare_request(&body, &spec.id, ctx.session_id.clone())
+                        .map_err(invalid_request_provider_error)?;
                 let upstream = client
                     .post(
                         spec.endpoint,
@@ -330,7 +377,7 @@ impl Provider for OpenCodeProvider {
 
         Ok(Generation {
             body: GenerationBody::LiveSse(body),
-            resolved_model: spec.id.to_string(),
+            resolved_model: spec.id,
         })
     }
 }
@@ -373,19 +420,19 @@ fn map_provider_error(error: ProviderError) -> Response {
     }
 }
 
-fn unsupported_model(requested: &str) -> Response {
+fn unsupported_model(gateway: &Gateway, requested: &str) -> Response {
     json_error(
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
-        format!("Unsupported OpenCode Go model: {requested}"),
+        format!("Unsupported {} model: {requested}", gateway.label),
     )
 }
 
-fn invalid_configuration_response(error: impl std::fmt::Display) -> Response {
+fn invalid_configuration_response(gateway: &Gateway, error: impl std::fmt::Display) -> Response {
     json_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "api_error",
-        format!("Invalid OpenCode Go configuration: {error}"),
+        format!("Invalid {} configuration: {error}", gateway.label),
     )
 }
 
@@ -397,11 +444,11 @@ fn invalid_request_response(error: impl std::fmt::Display) -> Response {
     )
 }
 
-fn invalid_upstream_response(error: impl std::fmt::Display) -> Response {
+fn invalid_upstream_response(gateway: &Gateway, error: impl std::fmt::Display) -> Response {
     json_error(
         StatusCode::BAD_GATEWAY,
         "api_error",
-        format!("OpenCode Go response translation failed: {error}"),
+        format!("{} response translation failed: {error}", gateway.label),
     )
 }
 
