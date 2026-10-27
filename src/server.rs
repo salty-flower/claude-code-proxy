@@ -1764,30 +1764,36 @@ async fn dispatch_request(
         monitor: state.monitor.clone(),
     };
 
+    let conversation_identity = if auto_review_route.is_some() {
+        None
+    } else {
+        conversation_identity
+    };
     // The substitute needs its own copy of the request, so take one only when
     // this model has a fallback configured.
     let fallback = (!count_tokens)
         .then(|| state.registry.fallback_for(&normalized_model))
         .flatten()
-        .map(|target| (target.to_string(), body.clone(), context.clone()));
+        .map(|target| {
+            (
+                target.to_string(),
+                body.clone(),
+                context.clone(),
+                conversation_identity.clone(),
+            )
+        });
 
     let response = if count_tokens {
         provider.handle_count_tokens(body, context).await
     } else {
         provider
-            .handle_messages_with_conversation_identity(
-                body,
-                context,
-                if auto_review_route.is_some() {
-                    None
-                } else {
-                    conversation_identity
-                },
-            )
+            .handle_messages_with_conversation_identity(body, context, conversation_identity)
             .await
     };
     let (response, provider, normalized_model) = match fallback {
-        Some((target, body, context)) if crate::fallback::is_fallback_status(response.status()) => {
+        Some((target, body, context, conversation_identity))
+            if crate::fallback::is_fallback_status(response.status()) =>
+        {
             run_fallback(
                 &state,
                 &log,
@@ -1799,6 +1805,7 @@ async fn dispatch_request(
                     target,
                     body,
                     context,
+                    conversation_identity,
                 },
             )
             .await
@@ -1859,11 +1866,13 @@ struct FallbackAttempt<'a> {
     target: String,
     body: crate::anthropic::schema::MessagesRequest,
     context: RequestContext,
+    conversation_identity: Option<ConversationIdentity>,
 }
 
 /// Retry a quota-rejected request once on its configured substitute. The
-/// rejection is returned unchanged when the substitute is not routable, so a
-/// stale fallback map degrades to the original error instead of a new one.
+/// original rejection is returned unchanged when the substitute is not
+/// routable or fails as well (an unconfigured key, its own quota), so a
+/// fallback never trades a retryable 429 for a new error.
 async fn run_fallback(
     state: &AppState,
     log: &Logger,
@@ -1877,6 +1886,7 @@ async fn run_fallback(
         target,
         mut body,
         mut context,
+        conversation_identity,
     } = attempt;
     let status = rejected.status();
     let Some(substitute) = state.registry.provider_for_model(&target, None) else {
@@ -1906,7 +1916,23 @@ async fn run_fallback(
     }
     body.model = Some(target.clone());
     context.provider = substitute.name().to_string();
-    let response = substitute.handle_messages(body, context).await;
+    let response = substitute
+        .handle_messages_with_conversation_identity(body, context, conversation_identity)
+        .await;
+    if !response.status().is_success() {
+        log.warn(
+            "model fallback failed; returning the original rejection",
+            Some(Map::from_iter([
+                ("reqId".to_string(), json!(req_id)),
+                ("toModel".to_string(), json!(&target)),
+                ("status".to_string(), json!(response.status().as_u16())),
+            ])),
+        );
+        if let Some(monitor) = state.monitor.as_ref() {
+            monitor.provider_selected(req_id, provider.name(), &model, None);
+        }
+        return (rejected, provider, model);
+    }
     (response, substitute, target)
 }
 

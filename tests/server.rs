@@ -1586,6 +1586,7 @@ struct StatusProvider {
     models: Vec<String>,
     status: StatusCode,
     seen: Arc<Mutex<Vec<String>>>,
+    identities: Arc<Mutex<Vec<Option<ConversationIdentity>>>>,
 }
 
 #[async_trait]
@@ -1614,6 +1615,16 @@ impl Provider for StatusProvider {
         (self.status, self.name).into_response()
     }
 
+    async fn handle_messages_with_conversation_identity(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+        conversation_identity: Option<ConversationIdentity>,
+    ) -> axum::response::Response {
+        self.identities.lock().unwrap().push(conversation_identity);
+        self.handle_messages(body, ctx).await
+    }
+
     async fn handle_count_tokens(
         &self,
         body: MessagesRequest,
@@ -1631,11 +1642,21 @@ struct FallbackFixture {
     app: axum::Router,
     primary_seen: Arc<Mutex<Vec<String>>>,
     substitute_seen: Arc<Mutex<Vec<String>>>,
+    substitute_identities: Arc<Mutex<Vec<Option<ConversationIdentity>>>>,
 }
 
 fn fallback_fixture(primary_status: StatusCode, fallbacks: &str) -> FallbackFixture {
+    fallback_fixture_with(primary_status, StatusCode::OK, fallbacks)
+}
+
+fn fallback_fixture_with(
+    primary_status: StatusCode,
+    substitute_status: StatusCode,
+    fallbacks: &str,
+) -> FallbackFixture {
     let primary_seen = Arc::new(Mutex::new(Vec::new()));
     let substitute_seen = Arc::new(Mutex::new(Vec::new()));
+    let substitute_identities = Arc::new(Mutex::new(Vec::new()));
     let registry = Registry::from_providers(
         AliasProvider::Codex,
         vec![
@@ -1647,12 +1668,14 @@ fn fallback_fixture(primary_status: StatusCode, fallbacks: &str) -> FallbackFixt
                 ],
                 status: primary_status,
                 seen: primary_seen.clone(),
+                identities: Arc::new(Mutex::new(Vec::new())),
             }) as Arc<dyn Provider>,
             Arc::new(StatusProvider {
                 name: "commandcode",
                 models: vec!["commandcode/zai-org/GLM-5.3".to_string()],
-                status: StatusCode::OK,
+                status: substitute_status,
                 seen: substitute_seen.clone(),
+                identities: substitute_identities.clone(),
             }),
         ],
     )
@@ -1661,17 +1684,31 @@ fn fallback_fixture(primary_status: StatusCode, fallbacks: &str) -> FallbackFixt
         app: app(Arc::new(registry)),
         primary_seen,
         substitute_seen,
+        substitute_identities,
     }
 }
 
 async fn post_messages(app: &axum::Router, path: &str, model: &str) -> (StatusCode, String) {
+    post_messages_with(app, path, model, &[]).await
+}
+
+async fn post_messages_with(
+    app: &axum::Router,
+    path: &str,
+    model: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, String) {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri(path)
-                .header("content-type", "application/json")
+            request
                 .body(Body::from(
                     json!({
                         "model": model,
@@ -1749,4 +1786,39 @@ async fn count_tokens_never_falls_back() {
     .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert!(fixture.substitute_seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failing_substitute_returns_the_original_rejection() {
+    let fixture = fallback_fixture_with(
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::UNAUTHORIZED,
+        GLM_FALLBACK,
+    );
+    let (status, body) = post_messages(&fixture.app, "/v1/messages", "opencode-go/glm-5.3").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body, "opencode");
+    assert_eq!(
+        *fixture.substitute_seen.lock().unwrap(),
+        ["commandcode/zai-org/GLM-5.3"]
+    );
+}
+
+#[tokio::test]
+async fn fallback_keeps_the_conversation_identity() {
+    let fixture = fallback_fixture(StatusCode::TOO_MANY_REQUESTS, GLM_FALLBACK);
+    let (status, _) = post_messages_with(
+        &fixture.app,
+        "/v1/messages",
+        "opencode-go/glm-5.3",
+        &[("x-claude-code-session-id", "session-main")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let identities = fixture.substitute_identities.lock().unwrap();
+    assert_eq!(identities.len(), 1);
+    assert!(
+        identities[0].is_some(),
+        "fallback dropped the conversation identity"
+    );
 }
