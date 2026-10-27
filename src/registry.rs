@@ -1,6 +1,7 @@
 use crate::{
     anthropic::{json_error, schema::MessagesRequest},
     config::AliasProvider,
+    fallback::FallbackMap,
     provider::{CliHandlers, Provider, RequestContext},
     providers::codex::translate::model_allowlist::{
         ALLOWED_MODELS, listed_catalog_models, tier_model_variants,
@@ -50,6 +51,7 @@ pub struct Registry {
     dynamic_codex: bool,
     models: BTreeMap<String, Vec<String>>,
     handlers: BTreeMap<String, Arc<dyn Provider>>,
+    fallbacks: FallbackMap,
 }
 
 impl Registry {
@@ -96,6 +98,7 @@ impl Registry {
             dynamic_codex: true,
             models,
             handlers,
+            fallbacks: FallbackMap::load_configured(),
         }
     }
 
@@ -119,7 +122,19 @@ impl Registry {
             dynamic_codex: false,
             models,
             handlers,
+            fallbacks: FallbackMap::default(),
         }
+    }
+
+    pub fn with_fallbacks(mut self, fallbacks: FallbackMap) -> Self {
+        self.fallbacks = fallbacks;
+        self
+    }
+
+    /// The model to retry when the upstream for `model` rejects it with a
+    /// quota or rate-limit error.
+    pub fn fallback_for(&self, model: &str) -> Option<&str> {
+        self.fallbacks.target_for(model)
     }
 
     pub fn list_provider_names(&self) -> Vec<String> {
