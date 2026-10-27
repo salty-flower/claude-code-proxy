@@ -33,18 +33,21 @@ impl std::fmt::Display for CompactionError {
     }
 }
 
+#[derive(Clone)]
 enum CompactionPhase {
     Preparing,
     Unconfirmed,
     Anchored { portable_summary: String },
 }
 
+#[derive(Clone)]
 struct CompactionState {
     attempt: CompactionAttempt,
     model: String,
     native_history: Vec<ResponsesInputItem>,
     phase: CompactionPhase,
     updated_at: u64,
+    preserve_replay_on_error: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +101,7 @@ pub fn begin_compaction(session_id: &str, model: &str) -> CompactionAttempt {
         native_history: Vec::new(),
         phase: CompactionPhase::Preparing,
         updated_at: now_ms(),
+        preserve_replay_on_error: false,
     };
     let now = state.updated_at;
     let mut guard = REGISTRY.lock().unwrap();
@@ -196,7 +200,9 @@ pub fn apply_compaction_replay(
         return None;
     }
     if state.model != request.model {
-        registry.states.remove(session_id);
+        if !state.preserve_replay_on_error {
+            registry.states.remove(session_id);
+        }
         update_total_bytes(registry);
         return None;
     }
@@ -207,12 +213,16 @@ pub fn apply_compaction_replay(
     let (envelope, conversation) = split_input_envelope(&request.input);
     let summary_item = conversation.first()?;
     let Some(text) = message_text(summary_item) else {
-        registry.states.remove(session_id);
+        if !state.preserve_replay_on_error {
+            registry.states.remove(session_id);
+        }
         update_total_bytes(registry);
         return None;
     };
     if text.match_indices(portable_summary).count() != 1 {
-        registry.states.remove(session_id);
+        if !state.preserve_replay_on_error {
+            registry.states.remove(session_id);
+        }
         update_total_bytes(registry);
         return None;
     }
@@ -228,7 +238,9 @@ pub fn apply_compaction_replay(
         .chain(conversation[1..].iter().cloned())
         .collect();
     if serialized_size(&replay.input) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
+        if !state.preserve_replay_on_error {
+            registry.states.remove(session_id);
+        }
         update_total_bytes(registry);
         return None;
     }
@@ -250,7 +262,7 @@ pub fn abort_compaction_attempt(session_id: Option<&str>, attempt: Option<Compac
     if registry
         .states
         .get(session_id)
-        .is_some_and(|state| state.attempt == attempt)
+        .is_some_and(|state| state.attempt == attempt && !state.preserve_replay_on_error)
     {
         registry.states.remove(session_id);
         update_total_bytes(registry);
@@ -263,6 +275,43 @@ pub fn clear_compaction(session_id: &str) {
         registry.states.remove(session_id);
         update_total_bytes(registry);
     }
+}
+
+pub(crate) fn has_required_compaction(session_id: Option<&str>) -> bool {
+    let Some(session_id) = session_id else {
+        return false;
+    };
+    REGISTRY
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|registry| registry.states.get(session_id))
+        .is_some_and(|state| state.preserve_replay_on_error)
+}
+
+/// Only copy fully anchored context. Both snapshots remain owned by their
+/// account/epoch namespace, so old requests cannot overwrite the new state.
+pub(crate) fn copy_anchored_compaction(from: &str, to: &str) {
+    let now = now_ms();
+    let mut guard = REGISTRY.lock().unwrap();
+    let Some(registry) = guard.as_mut() else {
+        return;
+    };
+    evict_states(registry, now);
+    if registry.states.contains_key(to) {
+        return;
+    }
+    let Some(state) = registry.states.get(from) else {
+        return;
+    };
+    if !matches!(state.phase, CompactionPhase::Anchored { .. }) {
+        return;
+    }
+    let mut state = state.clone();
+    state.updated_at = now;
+    state.preserve_replay_on_error = true;
+    registry.states.insert(to.to_owned(), state);
+    evict_states(registry, now);
 }
 
 fn split_input_envelope(
@@ -692,6 +741,58 @@ mod tests {
             "gpt-5.6-sol",
             &output(SUMMARY),
         ));
+    }
+
+    #[test]
+    fn rotate_compaction_copy_keeps_opaque_context_and_rejects_old_owner_publication() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let attempt = stored_compaction(
+            "account-a-epoch-1",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "opaque-critical-context".to_owned(),
+            }],
+        );
+        assert!(activate_compaction(
+            Some("account-a-epoch-1"),
+            Some(attempt),
+            "gpt-5.6-sol",
+            &output(SUMMARY)
+        ));
+        copy_anchored_compaction("account-a-epoch-1", "account-b-epoch-2");
+        let newer_old_attempt = begin_compaction("account-a-epoch-1", "gpt-5.6-sol");
+        assert!(store_compaction(
+            "account-a-epoch-1",
+            newer_old_attempt,
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "late-old-context".to_owned(),
+            }]
+        ));
+        let original = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue without repeating the completed tool"}]}
+        ]));
+        let replay = apply_compaction_replay(Some("account-b-epoch-2"), &original).unwrap();
+        assert!(
+            matches!(&replay.request.input[0], ResponsesInputItem::Compaction { encrypted_content } if encrypted_content == "opaque-critical-context")
+        );
+        assert_eq!(replay.request.input.len(), 2);
+        assert!(matches!(
+            &original.input[0],
+            ResponsesInputItem::Message { .. }
+        ));
+        // An explicit encrypted-context rejection must not make a subsequent
+        // identical request silently degrade to the caller's portable summary.
+        abort_compaction_attempt(Some("account-b-epoch-2"), Some(replay.attempt));
+        let retried = apply_compaction_replay(Some("account-b-epoch-2"), &original).unwrap();
+        assert!(
+            matches!(&retried.request.input[0], ResponsesInputItem::Compaction { encrypted_content } if encrypted_content == "opaque-critical-context")
+        );
+        let mut incompatible = original.clone();
+        incompatible.model = "different-model".to_owned();
+        assert!(apply_compaction_replay(Some("account-b-epoch-2"), &incompatible).is_none());
+        assert!(has_required_compaction(Some("account-b-epoch-2")));
+        assert!(apply_compaction_replay(Some("account-b-epoch-2"), &original).is_some());
     }
 
     #[test]

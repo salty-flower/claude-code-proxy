@@ -64,6 +64,8 @@ pub(crate) struct ContinuationReservation {
     candidate: ContinuationCandidate,
     owner: Option<ConversationIdentity>,
     origin_socket_id: Option<u64>,
+    credential_scope: Option<String>,
+    reasoning_provenance: Option<String>,
 }
 
 impl ContinuationReservation {
@@ -76,6 +78,8 @@ impl ContinuationReservation {
             candidate,
             owner,
             origin_socket_id,
+            credential_scope: None,
+            reasoning_provenance: None,
         }
     }
 
@@ -116,6 +120,24 @@ impl ContinuationReservation {
         self.origin_socket_id
     }
 
+    pub(crate) fn credential_scope(&self) -> Option<&str> {
+        self.credential_scope.as_deref()
+    }
+
+    pub(crate) fn with_credential_scope(mut self, scope: Option<String>) -> Self {
+        self.credential_scope = scope;
+        self
+    }
+
+    pub(crate) fn with_reasoning_provenance(mut self, scope: Option<String>) -> Self {
+        self.reasoning_provenance = scope;
+        self
+    }
+
+    pub(crate) fn reasoning_provenance(&self) -> Option<&str> {
+        self.reasoning_provenance.as_deref()
+    }
+
     pub(crate) fn into_candidate(self) -> ContinuationCandidate {
         self.candidate
     }
@@ -126,6 +148,8 @@ impl ContinuationReservation {
         candidate.input_delta = None;
         candidate.disabled_reason = Some("full_context_retry".to_string());
         Self::new(candidate, self.owner.clone(), None)
+            .with_credential_scope(self.credential_scope.clone())
+            .with_reasoning_provenance(self.reasoning_provenance.clone())
     }
 }
 
