@@ -8,7 +8,9 @@ use crate::traffic::TrafficCapture;
 
 use super::IncompleteResponsePolicy;
 use super::read_rewrite::sanitize_read_args;
-use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
+use super::reasoning_signature::{
+    PendingReasoning, encode_reasoning_signature, signature_with_provenance,
+};
 use super::reducer::{
     CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic,
 };
@@ -61,6 +63,7 @@ pub struct LiveStreamTranslator {
     anthropic_index: usize,
     thinking: Option<LiveThinking>,
     reasoning_by_output_index: HashMap<usize, PendingReasoning>,
+    reasoning_provenance: Option<String>,
     saw_tool_use: bool,
     web_search_requests: usize,
     web_searches: Vec<LiveWebSearch>,
@@ -93,6 +96,7 @@ impl LiveStreamTranslator {
             anthropic_index: 0,
             thinking: None,
             reasoning_by_output_index: HashMap::new(),
+            reasoning_provenance: None,
             saw_tool_use: false,
             web_search_requests: 0,
             web_searches: Vec::new(),
@@ -110,6 +114,11 @@ impl LiveStreamTranslator {
         policy: IncompleteResponsePolicy,
     ) -> Self {
         self.incomplete_response_policy = policy;
+        self
+    }
+
+    pub(crate) fn with_reasoning_provenance(mut self, provenance: Option<&str>) -> Self {
+        self.reasoning_provenance = provenance.map(str::to_owned);
         self
     }
 
@@ -1003,6 +1012,7 @@ impl LiveStreamTranslator {
         let Some(signature) = encode_reasoning_signature(&replay) else {
             return;
         };
+        let signature = signature_with_provenance(signature, self.reasoning_provenance.as_deref());
         self.semantic_output_started = true;
         let index = self.anthropic_index;
         self.anthropic_index += 1;
@@ -1047,6 +1057,9 @@ impl LiveStreamTranslator {
             .remove(&thinking.output_index)
             .and_then(|pending| pending.replay())
             .and_then(|replay| encode_reasoning_signature(&replay))
+            .map(|signature| {
+                signature_with_provenance(signature, self.reasoning_provenance.as_deref())
+            })
         {
             self.emit(
                 traffic,

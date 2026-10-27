@@ -309,6 +309,7 @@ struct PoolEntry {
     socket_id: u64,
     created_at: u64,
     last_activity: AtomicU64,
+    credential_scope: Option<String>,
 }
 
 impl PoolEntry {
@@ -318,7 +319,19 @@ impl PoolEntry {
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
             created_at: now_ms(),
             last_activity: AtomicU64::new(next_pool_activity()),
+            credential_scope: None,
         }
+    }
+
+    fn for_reservation(
+        ws: CodexWebSocketStream,
+        reservation: Option<&ContinuationReservation>,
+    ) -> Self {
+        let mut entry = Self::new(ws);
+        entry.credential_scope = reservation
+            .and_then(ContinuationReservation::credential_scope)
+            .map(str::to_owned);
+        entry
     }
 
     fn touch(&self) {
@@ -455,7 +468,11 @@ fn take_pool_entry_for_request(
     let pool_owner = reservation_pool_owner(reservation);
     let pooled = reservation
         .filter(|_| pool_owner.is_some())
-        .and_then(pool_take_for_turn);
+        .and_then(pool_take_for_turn)
+        .filter(|entry| {
+            entry.credential_scope.as_deref()
+                == reservation.and_then(ContinuationReservation::credential_scope)
+        });
 
     if requires_origin
         && (pool_owner.is_none()
@@ -474,6 +491,9 @@ fn take_pool_entry_for_request(
 }
 
 fn pool_insert_for_turn(reservation: &ContinuationReservation, entry: Arc<PoolEntry>) -> bool {
+    if entry.credential_scope.as_deref() != reservation.credential_scope() {
+        return false;
+    }
     let Some(owner) = reservation_pool_owner(Some(reservation)).cloned() else {
         return false;
     };
@@ -787,7 +807,7 @@ pub(super) async fn codex_websocket_request(
     let mut entry = if let Some(entry) = pooled {
         entry
     } else {
-        Arc::new(PoolEntry::new(
+        Arc::new(PoolEntry::for_reservation(
             connect_with_timeout(
                 websocket_client,
                 proxy_config,
@@ -796,6 +816,7 @@ pub(super) async fn codex_websocket_request(
                 connect_timeout_ms,
             )
             .await?,
+            reservation,
         ))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
@@ -812,7 +833,7 @@ pub(super) async fn codex_websocket_request(
         if requires_origin {
             return Err(continuation_socket_missing_error());
         }
-        entry = Arc::new(PoolEntry::new(
+        entry = Arc::new(PoolEntry::for_reservation(
             connect_with_timeout(
                 websocket_client,
                 proxy_config,
@@ -821,6 +842,7 @@ pub(super) async fn codex_websocket_request(
                 connect_timeout_ms,
             )
             .await?,
+            reservation,
         ));
         guard = entry.ws.clone().lock_owned().await;
         used_pooled = false;
@@ -997,7 +1019,7 @@ pub(super) async fn prepare_codex_websocket(
             connect_timeout_ms,
         )
         .await?;
-        Arc::new(PoolEntry::new(stream))
+        Arc::new(PoolEntry::for_reservation(stream, reservation))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
     if used_pooled
@@ -2595,6 +2617,7 @@ mod tests {
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
             created_at: now_ms(),
             last_activity: AtomicU64::new(next_pool_activity()),
+            credential_scope: None,
         })
     }
 
@@ -3338,6 +3361,37 @@ mod tests {
 
         assert_ne!(first.socket_id, 0);
         assert!(second.socket_id > first.socket_id);
+    }
+
+    #[tokio::test]
+    async fn rotate_pool_rejects_old_credential_revision_and_late_return() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = lock_codex_websocket_pool_for_tests().await;
+        let owner = main_owner("rotate-revision-test");
+        let request = continuation_request();
+        let reserved = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        )
+        .with_credential_scope(Some("account-a:epoch-4:revision-1".to_owned()));
+        let old = Arc::new(PoolEntry::for_reservation(
+            raw_test_stream(None).await,
+            Some(&reserved),
+        ));
+        assert!(pool_insert_for_turn(&reserved, old.clone()));
+        let refreshed = reserved
+            .clone()
+            .with_credential_scope(Some("account-a:epoch-4:revision-2".to_owned()));
+        assert!(
+            take_pool_entry_for_request(Some(&refreshed))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!pool_insert_for_turn(&refreshed, old));
+        assert!(WS_POOL.lock().unwrap().get(&owner).is_none());
+        super::super::continuation::abort_continuation_for_owner(&reserved);
     }
 
     #[tokio::test]

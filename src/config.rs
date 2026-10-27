@@ -50,6 +50,8 @@ struct FileConfig {
 
 #[derive(Deserialize, Clone)]
 struct CodexConfig {
+    #[serde(rename = "rotateHelper")]
+    pub rotate_helper: Option<Vec<String>>,
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,
     #[serde(rename = "originator")]
@@ -727,6 +729,47 @@ pub fn kimi_user_agent(default: &str) -> String {
 // Codex config
 // ---------------------------------------------------------------------------
 
+/// Personal credential authority. Invalid explicit configuration never falls
+/// back to the proxy's independent refresh-token store.
+pub(crate) fn codex_rotate_helper() -> Result<Option<Vec<String>>, String> {
+    let argv = match std::env::var("CCP_CODEX_ROTATE_HELPER") {
+        Ok(raw) => Some(
+            serde_json::from_str::<Vec<String>>(&raw)
+                .map_err(|_| "Invalid CCP_CODEX_ROTATE_HELPER: expected JSON argv".to_string())?,
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("Invalid Codex rotate helper configuration".to_string());
+        }
+        Err(std::env::VarError::NotPresent) => {
+            codex_rotate_helper_from_file(&paths::config_dir().join("config.json"))?
+        }
+    };
+    if let Some(argv) = argv.as_ref()
+        && (argv.is_empty()
+            || !Path::new(&argv[0]).is_absolute()
+            || argv.len() > 32
+            || argv
+                .iter()
+                .any(|arg| arg.len() > 4096 || arg.contains('\0')))
+    {
+        return Err("Invalid Codex rotate helper: absolute executable argv required".to_string());
+    }
+    Ok(argv)
+}
+
+fn codex_rotate_helper_from_file(path: &Path) -> Result<Option<Vec<String>>, String> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("Could not read Codex rotate helper configuration".to_string()),
+    };
+    // Unlike the general tolerant loader, an existing malformed config must
+    // never silently restore the independent private refresh-token authority.
+    let file: FileConfig = serde_json::from_str(&raw)
+        .map_err(|_| "Invalid Codex rotate helper configuration".to_string())?;
+    Ok(file.codex.and_then(|codex| codex.rotate_helper))
+}
+
 pub fn codex_base_url(default: &str) -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_BASE_URL") {
@@ -1270,6 +1313,28 @@ mod tests {
         let env = config_env(&config);
 
         assert_eq!(load_config_for_env(&env).bind_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn rotate_helper_file_configuration_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        assert_eq!(codex_rotate_helper_from_file(&path).unwrap(), None);
+        for malformed in [
+            r#"{"codex":{"rotateHelper":["/helper"]}"#,
+            r#"{"codex":{"rotateHelper":"/helper"}}"#,
+            "not JSON",
+        ] {
+            std::fs::write(&path, malformed).unwrap();
+            assert!(codex_rotate_helper_from_file(&path).is_err());
+        }
+        std::fs::write(&path, r#"{"codex":{"rotateHelper":["/helper","rpc"]}}"#).unwrap();
+        assert_eq!(
+            codex_rotate_helper_from_file(&path).unwrap(),
+            Some(vec!["/helper".to_owned(), "rpc".to_owned()])
+        );
+        std::fs::write(&path, r#"{"codex":{"transport":"websocket"}}"#).unwrap();
+        assert_eq!(codex_rotate_helper_from_file(&path).unwrap(), None);
     }
 
     #[test]

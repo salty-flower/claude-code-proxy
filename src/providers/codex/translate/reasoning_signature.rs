@@ -2,6 +2,7 @@ use base64::Engine;
 use serde_json::Value;
 
 const PREFIX: &str = "ccp:codex:v1:";
+const PROVENANCE_PREFIX: &str = "ccp:codex:v2:";
 const MAX_ID_BYTES: usize = 4 * 1024;
 const MAX_ENCRYPTED_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -58,7 +59,18 @@ pub fn encode_reasoning_signature(replay: &ReasoningReplay) -> Option<String> {
 }
 
 pub fn decode_reasoning_signature(signature: &str) -> Option<ReasoningReplay> {
-    let payload = signature.strip_prefix(PREFIX)?;
+    // v1 remains replayable with unknown provenance. v2 records origin but
+    // does not discard ciphertext on account changes: cross-account replay is
+    // provisionally supported and must fail explicitly if upstream rejects it.
+    let payload = if let Some(payload) = signature.strip_prefix(PROVENANCE_PREFIX) {
+        let (provenance, payload) = payload.split_once(':')?;
+        if !valid_provenance(provenance) {
+            return None;
+        }
+        payload
+    } else {
+        signature.strip_prefix(PREFIX)?
+    };
     if payload.is_empty() || payload.len() > max_payload_len() {
         return None;
     }
@@ -80,6 +92,37 @@ pub fn decode_reasoning_signature(signature: &str) -> Option<ReasoningReplay> {
         id: String::from_utf8(id).ok()?,
         encrypted_content: encrypted_content.to_string(),
     })
+}
+
+fn valid_provenance(provenance: &str) -> bool {
+    provenance.len() == 64 && provenance.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn signature_with_provenance(signature: String, provenance: Option<&str>) -> String {
+    match (provenance, signature.strip_prefix(PREFIX)) {
+        (Some(provenance), Some(payload)) if valid_provenance(provenance) => {
+            format!("{PROVENANCE_PREFIX}{provenance}:{payload}")
+        }
+        _ => signature,
+    }
+}
+
+pub(crate) fn annotate_response_signatures(response: &mut Value, provenance: &str) {
+    if let Some(content) = response.get_mut("content").and_then(Value::as_array_mut) {
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("thinking") {
+                continue;
+            }
+            if let Some(signature) = block.get_mut("signature")
+                && let Some(value) = signature.as_str()
+            {
+                *signature = Value::String(signature_with_provenance(
+                    value.to_owned(),
+                    Some(provenance),
+                ));
+            }
+        }
+    }
 }
 
 fn encoded_id_len_limit() -> usize {
@@ -109,6 +152,21 @@ mod tests {
         assert!(signature.starts_with(PREFIX));
         assert!(signature.ends_with(":gAAAAopaque"));
         assert_eq!(decode_reasoning_signature(&signature), Some(replay));
+    }
+
+    #[test]
+    fn rotate_signature_provenance_migrates_v1_without_losing_ciphertext() {
+        let replay = ReasoningReplay {
+            id: "rs_1".to_owned(),
+            encrypted_content: "opaque-cross-account".to_owned(),
+        };
+        let legacy = encode_reasoning_signature(&replay).unwrap();
+        let provenance = "a".repeat(64);
+        let annotated = signature_with_provenance(legacy.clone(), Some(&provenance));
+        assert!(annotated.starts_with(PROVENANCE_PREFIX));
+        assert_eq!(decode_reasoning_signature(&legacy), Some(replay.clone()));
+        assert_eq!(decode_reasoning_signature(&annotated), Some(replay));
+        assert!(decode_reasoning_signature("ccp:codex:v2:invalid:rs:ciphertext").is_none());
     }
 
     #[test]

@@ -1761,6 +1761,124 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn rotate_compaction_errors_and_restart_never_fall_back_to_portable_summary() {
+    let _guard = env_lock();
+    clear_all_compactions_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let helper_response = config.path().join("helper-response.json");
+    let snapshot = |account: &str, epoch: u64| {
+        json!({
+            "version":1,"ok":true,"snapshot": {
+                "account_key": account,"account_id":account,"selection_epoch":epoch,
+                "credential_revision":1,"access_token":"fixture-access","expires_at":4_000_000_000_u64
+            }
+        })
+    };
+    std::fs::write(
+        &helper_response,
+        serde_json::to_vec(&snapshot("a", 100)).unwrap(),
+    )
+    .unwrap();
+    let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("sh"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let helper = json!([
+        shell,
+        "-c",
+        "IFS= read -r request; exec cat \"$1\"",
+        "fixture",
+        helper_response
+    ]);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    const SUMMARY: &str =
+        "portable summary with enough detail to anchor the compacted conversation";
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            let compact = body["input"].as_array().unwrap().last().unwrap()["type"] == "compaction_trigger";
+            let mut requests = captured.lock().unwrap();
+            requests.push(body);
+            if compact {
+                return b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque-critical-context\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n".to_vec();
+            }
+            if requests.len() > 2 && requests.len() < 5 {
+                assert!(requests.last().unwrap().to_string().contains("opaque-critical-context"));
+                return b"data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_encrypted_content\",\"status\":400,\"message\":\"opaque context rejected\"}}\n\n".to_vec();
+            }
+            format!(
+                "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"message\",\"id\":\"msg_1\"}}}}\n\n\
+                 data: {{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"{SUMMARY}\"}}\n\n\
+                 data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"message\"}}}}\n\n\
+                 data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\",\"usage\":{{}}}}}}\n\n"
+            ).into_bytes()
+        }
+    }).await;
+    let _config = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _helper = EnvGuard::set("CCP_CODEX_ROTATE_HELPER", helper.to_string());
+    let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _base = EnvGuard::set("CCP_CODEX_BASE_URL", upstream);
+    let _compaction = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+    let compact = call_messages_body(json!({
+        "model":"gpt-5.6-sol","max_tokens":64,
+        "system":"You are a helpful AI assistant tasked with summarizing conversations.",
+        "messages":[{"role":"user","content":"original full context: completed tool returned fact-42"}]
+    })).await;
+    assert_eq!(compact.status(), StatusCode::OK);
+    assert_eq!(captured.lock().unwrap().len(), 2);
+    std::fs::write(
+        &helper_response,
+        serde_json::to_vec(&snapshot("b", 101)).unwrap(),
+    )
+    .unwrap();
+    let continuation = || {
+        json!({
+            "model":"gpt-5.6-sol","max_tokens":64,
+            "messages":[{"role":"user","content":SUMMARY},{"role":"user","content":"continue"}]
+        })
+    };
+    for _ in 0..2 {
+        let response = call_messages_body(continuation()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        4,
+        "both rejected requests must carry opaque context"
+    );
+    clear_all_compactions_for_tests();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+    for account in ["b", "c"] {
+        std::fs::write(
+            &helper_response,
+            serde_json::to_vec(&snapshot(account, if account == "b" { 101 } else { 102 })).unwrap(),
+        )
+        .unwrap();
+        let response = call_messages_body(continuation()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Start a new Claude conversation"));
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            4,
+            "missing protected cache must fail before upstream transport"
+        );
+    }
+    let restored = app(Arc::new(Registry::with_default_alias())).oneshot(
+        Request::builder().method(Method::POST).uri("/v1/messages")
+            .header("content-type","application/json").header("x-claude-code-session-id","restored-new-logical-conversation")
+            .body(Body::from(json!({"model":"gpt-5.6-sol","max_tokens":64,"messages":[{"role":"user","content":"restored original full context: completed tool returned fact-42"}]}).to_string())).unwrap()
+    ).await.unwrap();
+    assert_eq!(restored.status(), StatusCode::OK);
+    assert_eq!(captured.lock().unwrap().len(), 5);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_compaction_failure_preserves_portable_summary() {
     let _guard = env_lock();
     clear_all_compactions_for_tests();

@@ -12,6 +12,7 @@ use crate::traffic::TrafficCapture;
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIGINATOR};
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
+use super::rotate::{Helper as RotateHelper, RequestAuth};
 pub use super::events::{CodexLimitWindow, CodexUsageLimit};
 use super::search::{SearchRequest, SearchResponse};
 use super::translate::request::ResponsesRequest;
@@ -378,7 +379,7 @@ struct HttpEventStreamState {
     response_headers: Vec<(String, String)>,
     started_at: Instant,
     body_json: String,
-    auth: StoredAuth,
+    auth: RequestAuth,
     auth_refresh_attempted: bool,
     use_responses_lite: bool,
     retries: u32,
@@ -687,13 +688,16 @@ fn test_websocket_http_client() -> reqwest::Client {
         .expect("failed to create test WebSocket HTTP client")
 }
 
+#[derive(Clone)]
 pub struct CodexHttpClient {
     client: reqwest::Client,
     native_client: reqwest::Client,
     websocket_client: reqwest::Client,
-    websocket_proxy_config: super::websocket::WebSocketProxyConfig,
+    websocket_proxy_config: Arc<super::websocket::WebSocketProxyConfig>,
     auto_http_fallback_enabled: bool,
-    auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
+    auth_manager: Arc<CodexAuthManager<DefaultCodexAuthStore>>,
+    rotate_helper: Result<Option<RotateHelper>, String>,
+    request_auth: Option<RequestAuth>,
     base_url: String,
     header_timeout_ms: u64,
     body_idle_timeout_ms: u64,
@@ -716,9 +720,11 @@ impl CodexHttpClient {
                 .expect("failed to create HTTP client"),
             native_client: native_http_client(&proxy_environment),
             websocket_client: websocket_http_client(&proxy_environment),
-            websocket_proxy_config: proxy_environment.websocket_proxy_config(),
+            websocket_proxy_config: Arc::new(proxy_environment.websocket_proxy_config()),
             auto_http_fallback_enabled: true,
-            auth_manager: CodexAuthManager::new(file_store()),
+            auth_manager: Arc::new(CodexAuthManager::new(file_store())),
+            rotate_helper: config::codex_rotate_helper().map(|argv| argv.map(RotateHelper::new)),
+            request_auth: None,
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
@@ -737,10 +743,12 @@ impl CodexHttpClient {
         Self {
             native_client: native_http_client(&proxy_environment),
             websocket_client: websocket_http_client(&proxy_environment),
-            websocket_proxy_config,
+            websocket_proxy_config: Arc::new(websocket_proxy_config),
             auto_http_fallback_enabled,
             client,
-            auth_manager,
+            auth_manager: Arc::new(auth_manager),
+            rotate_helper: config::codex_rotate_helper().map(|argv| argv.map(RotateHelper::new)),
+            request_auth: None,
             base_url,
             header_timeout_ms: config::codex_header_timeout_ms(),
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
@@ -757,10 +765,12 @@ impl CodexHttpClient {
         Self {
             native_client: test_native_http_client(),
             websocket_client: test_websocket_http_client(),
-            websocket_proxy_config: super::websocket::WebSocketProxyConfig::direct(),
+            websocket_proxy_config: Arc::new(super::websocket::WebSocketProxyConfig::direct()),
             auto_http_fallback_enabled: true,
             client,
-            auth_manager: CodexAuthManager::new(file_store()),
+            auth_manager: Arc::new(CodexAuthManager::new(file_store())),
+            rotate_helper: Ok(None),
+            request_auth: None,
             base_url,
             header_timeout_ms,
             body_idle_timeout_ms,
@@ -769,6 +779,77 @@ impl CodexHttpClient {
 
     pub fn auth_manager(&self) -> &CodexAuthManager<DefaultCodexAuthStore> {
         &self.auth_manager
+    }
+
+    /// Acquire before any context transformation; clones share transports, not
+    /// mutable account selection. Spawned stream tasks retain this bound client.
+    pub(crate) async fn for_request(&self, model: &str) -> Result<Self, CodexError> {
+        let mut client = self.clone();
+        match self.rotate_helper.as_ref() {
+            Ok(Some(helper)) => {
+                client.request_auth = Some(
+                    helper
+                        .acquire(Some(model))
+                        .await
+                        .map_err(auth_refresh_error)?,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => return Err(auth_refresh_error(anyhow::anyhow!(error.clone()))),
+        }
+        Ok(client)
+    }
+
+    pub(crate) fn scope_context(
+        &self,
+        owner: Option<&ConversationIdentity>,
+        session: Option<&str>,
+    ) -> (Option<ConversationIdentity>, Option<String>) {
+        match self.request_auth.as_ref().and_then(RequestAuth::snapshot) {
+            Some(snapshot) => super::rotate::scope_context(snapshot, owner, session),
+            None => (owner.cloned(), session.map(str::to_owned)),
+        }
+    }
+
+    pub(crate) fn reasoning_provenance(&self) -> Option<String> {
+        self.request_auth
+            .as_ref()
+            .and_then(RequestAuth::snapshot)
+            .map(super::rotate::Snapshot::scope)
+    }
+
+    pub(crate) fn replay_marker(
+        &self,
+        owner: Option<&ConversationIdentity>,
+        session: Option<&str>,
+    ) -> Option<super::rotate_context::ReplayMarker> {
+        self.request_auth.as_ref()?.snapshot()?;
+        super::rotate_context::ReplayMarker::for_owner(&crate::paths::config_dir(), owner, session)
+    }
+
+    async fn get_auth(&self) -> anyhow::Result<RequestAuth> {
+        if let Some(auth) = self.request_auth.as_ref() {
+            return Ok(auth.clone());
+        }
+        match self.rotate_helper.as_ref() {
+            Ok(Some(helper)) => helper.acquire(None).await,
+            Ok(None) => self
+                .auth_manager
+                .get_auth()
+                .await
+                .map(RequestAuth::internal),
+            Err(error) => Err(anyhow::anyhow!(error.clone())),
+        }
+    }
+
+    async fn refresh_auth(&self, rejected: &RequestAuth) -> anyhow::Result<RequestAuth> {
+        if let Some(result) = rejected.refresh_external().await {
+            return result;
+        }
+        self.auth_manager
+            .force_refresh(&rejected.access)
+            .await
+            .map(RequestAuth::internal)
     }
 
     pub fn body_idle_timeout_ms(&self) -> u64 {
@@ -782,18 +863,14 @@ impl CodexHttpClient {
         ctx: &RequestContext,
     ) -> Result<reqwest::Response, CodexError> {
         let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
-        let mut auth = self
-            .auth_manager
-            .get_auth()
-            .await
-            .map_err(|error| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(error.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+        let mut auth = self.get_auth().await.map_err(|error| CodexError {
+            status: 401,
+            message: "Auth error".to_string(),
+            detail: Some(error.to_string()),
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::Auth,
+        })?;
         let mut refresh_attempted = false;
 
         loop {
@@ -802,11 +879,7 @@ impl CodexHttpClient {
             if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
                 refresh_attempted = true;
                 drop(response);
-                auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
+                auth = self.refresh_auth(&auth).await.map_err(auth_refresh_error)?;
                 continue;
             }
             return Ok(response);
@@ -884,18 +957,14 @@ impl CodexHttpClient {
             base_url.trim_end_matches('/'),
             operation.upstream_path()
         );
-        let mut auth = self
-            .auth_manager
-            .get_auth()
-            .await
-            .map_err(|error| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(error.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+        let mut auth = self.get_auth().await.map_err(|error| CodexError {
+            status: 401,
+            message: "Auth error".to_string(),
+            detail: Some(error.to_string()),
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::Auth,
+        })?;
         let mut refresh_attempted = false;
 
         loop {
@@ -906,11 +975,7 @@ impl CodexHttpClient {
             if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
                 refresh_attempted = true;
                 drop(response);
-                auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
+                auth = self.refresh_auth(&auth).await.map_err(auth_refresh_error)?;
                 continue;
             }
             return Ok(response);
@@ -960,6 +1025,17 @@ impl CodexHttpClient {
         use_responses_lite: bool,
         stream: bool,
     ) -> Result<reqwest::Response, CodexError> {
+        if self.rotate_helper.as_ref().is_ok_and(Option::is_some) {
+            return Err(CodexError {
+                status: 400,
+                message: "Native Responses API is unavailable with Codex Rotate; use /v1/messages"
+                    .to_owned(),
+                detail: None,
+                retry_after: None,
+                usage_limit: None,
+                origin: CodexErrorOrigin::Http,
+            });
+        }
         let body_json = serde_json::to_string(body).map_err(|err| CodexError {
             status: 500,
             message: "Failed to serialize native Responses request".to_string(),
@@ -968,18 +1044,14 @@ impl CodexHttpClient {
             usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?;
-        let mut auth = self
-            .auth_manager
-            .get_auth()
-            .await
-            .map_err(|err| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(err.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+        let mut auth = self.get_auth().await.map_err(|err| CodexError {
+            status: 401,
+            message: "Auth error".to_string(),
+            detail: Some(err.to_string()),
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::Auth,
+        })?;
         let mut refresh_attempted = false;
 
         loop {
@@ -996,11 +1068,7 @@ impl CodexHttpClient {
             if status == 401 && !refresh_attempted {
                 refresh_attempted = true;
                 drop(response);
-                auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
+                auth = self.refresh_auth(&auth).await.map_err(auth_refresh_error)?;
                 continue;
             }
 
@@ -1080,7 +1148,7 @@ impl CodexHttpClient {
         body: &SearchRequest,
         ctx: &RequestContext,
     ) -> Result<SearchResponse, CodexError> {
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+        let mut auth = self.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
@@ -1103,11 +1171,7 @@ impl CodexHttpClient {
             let response = self.attempt_post_search(&auth, &body_json, ctx).await?;
             if response.status == 401 && !auth_refresh_attempted {
                 auth_refresh_attempted = true;
-                auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
+                auth = self.refresh_auth(&auth).await.map_err(auth_refresh_error)?;
                 continue;
             }
             if should_retry_codex_status(response.status)
@@ -1145,7 +1209,7 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+        let mut auth = self.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
@@ -1218,7 +1282,7 @@ impl CodexHttpClient {
 
     async fn start_http_event_attempt(
         &self,
-        auth: &mut StoredAuth,
+        auth: &mut RequestAuth,
         body_json: &str,
         ctx: &RequestContext,
         use_responses_lite: bool,
@@ -1231,11 +1295,7 @@ impl CodexHttpClient {
 
             if resp.status().as_u16() == 401 && !*auth_refresh_attempted {
                 *auth_refresh_attempted = true;
-                *auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
+                *auth = self.refresh_auth(auth).await.map_err(auth_refresh_error)?;
                 continue;
             }
 
@@ -1634,7 +1694,7 @@ impl CodexHttpClient {
     ) -> Result<OwnerAwareCodexResponse, CodexError> {
         use crate::config::CodexTransport;
 
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+        let mut auth = self.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
@@ -1657,6 +1717,8 @@ impl CodexHttpClient {
         let mut auth_refresh_attempted = false;
         let mut transport_failures = 0u32;
         loop {
+            active_continuation =
+                credential_scoped_continuation(active_continuation.as_ref(), &auth);
             let result = match transport {
                 CodexTransport::Http => {
                     let body_json = serde_json::to_string(body).map_err(|e| CodexError {
@@ -1763,7 +1825,7 @@ impl CodexHttpClient {
 
             if should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport) {
                 auth_refresh_attempted = true;
-                match self.auth_manager.force_refresh(&auth.access).await {
+                match self.refresh_auth(&auth).await {
                     Ok(new_auth) => {
                         auth = new_auth;
                         invalidate_live_continuation_pool(active_continuation.as_ref());
@@ -2019,7 +2081,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+        let auth = self.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
@@ -2063,7 +2125,7 @@ impl CodexHttpClient {
         body: ResponsesRequest,
         ctx: RequestContext,
         mut continuation: Option<super::continuation::ContinuationReservation>,
-        mut auth: StoredAuth,
+        mut auth: RequestAuth,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
         socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
     ) {
@@ -2075,6 +2137,7 @@ impl CodexHttpClient {
         let mut forwarded_any = false;
 
         'attempt: loop {
+            continuation = credential_scoped_continuation(continuation.as_ref(), &auth);
             socket_id_publisher.publish(None);
             let ws_headers = match build_codex_headers(&auth, &ctx, body.client_metadata.is_some())
             {
@@ -2121,7 +2184,7 @@ impl CodexHttpClient {
                     Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
                         auth_refresh_attempted = true;
                         invalidate_live_continuation_pool(continuation.as_ref());
-                        let refresh = self.auth_manager.force_refresh(&auth.access);
+                        let refresh = self.refresh_auth(&auth);
                         auth = match refresh.await {
                             Ok(auth) => {
                                 if tx.is_closed() {
@@ -2209,7 +2272,7 @@ impl CodexHttpClient {
                 if unauthorized && !auth_refresh_attempted && !forwarded_any {
                     auth_refresh_attempted = true;
                     invalidate_live_continuation_pool(continuation.as_ref());
-                    let refresh = self.auth_manager.force_refresh(&auth.access);
+                    let refresh = self.refresh_auth(&auth);
                     auth = match refresh.await {
                         Ok(auth) => {
                             if tx.is_closed() {
@@ -3045,6 +3108,18 @@ fn full_context_continuation(
     continuation.map(super::continuation::ContinuationReservation::full_context_retry)
 }
 
+fn credential_scoped_continuation(
+    continuation: Option<&super::continuation::ContinuationReservation>,
+    auth: &RequestAuth,
+) -> Option<super::continuation::ContinuationReservation> {
+    let scope = auth
+        .snapshot()
+        .map(super::rotate::Snapshot::socket_revision);
+    continuation
+        .cloned()
+        .map(|reservation| reservation.with_credential_scope(scope))
+}
+
 fn abort_live_continuation(continuation: Option<&super::continuation::ContinuationReservation>) {
     if let Some(continuation) = continuation {
         super::continuation::abort_continuation_for_owner(continuation);
@@ -3398,6 +3473,236 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotate_http_401_refresh_uses_failed_account_after_selection_changes() {
+        use super::super::rotate::tests::{Fixture, snapshot};
+        let fixture = Arc::new(Fixture::new(snapshot("a", 10, 4)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut base = authenticated_http_test_client(format!("http://{address}/responses"));
+        base.rotate_helper = Ok(Some(fixture.helper.clone()));
+        let bound = base.for_request("gpt-5.6-sol").await.unwrap();
+        fixture.respond(snapshot("b", 11, 1));
+        let other = base.for_request("gpt-5.6-sol").await.unwrap();
+        assert_eq!(
+            other.request_auth.as_ref().unwrap().account_id.as_deref(),
+            Some("account-b")
+        );
+        let server_fixture = fixture.clone();
+        let server = tokio::spawn(async move {
+            for revision in [4, 5] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.contains(&format!("authorization: Bearer access-a-{revision}")));
+                assert!(request.contains("chatgpt-account-id: account-a"));
+                assert!(request.contains("opaque-reasoning"));
+                assert!(request.contains("completed-tool-result"));
+                if revision == 4 {
+                    server_fixture.respond(snapshot("a", 10, 5));
+                    stream.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let mut request = buffered_test_request();
+        request.input = serde_json::from_value(serde_json::json!([
+            {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque-reasoning", "summary": []},
+            {"type": "function_call_output", "call_id": "call_1", "output": "completed-tool-result"}
+        ])).unwrap();
+        let response = bound
+            .post_codex_with_transport(
+                &request,
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        server.await.unwrap();
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2]["account_key"], "key-a");
+        assert_eq!(requests[2]["selection_epoch"], 10);
+        assert_eq!(requests[2]["rejected_revision"], 4);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // tungstenite's fixed handshake callback error type
+    async fn rotate_websocket_switch_opens_new_account_socket_with_full_opaque_context() {
+        use super::super::rotate::tests::{Fixture, snapshot};
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let fixture = Fixture::new(snapshot("a", 20, 1));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for account in ["a", "b"] {
+                let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut websocket = tokio_tungstenite::accept_hdr_async(
+                    socket,
+                    |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                     response| {
+                        assert_eq!(
+                            request.headers()["authorization"],
+                            format!("Bearer access-{account}-1")
+                        );
+                        assert_eq!(
+                            request.headers()["chatgpt-account-id"],
+                            format!("account-{account}")
+                        );
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                let request = next_websocket_json(&mut websocket).await;
+                assert!(request.get("previous_response_id").is_none());
+                assert!(request.to_string().contains("opaque-reasoning"));
+                assert!(request.to_string().contains("completed-tool-result"));
+                send_completed_websocket_response(&mut websocket, &format!("resp-{account}")).await;
+            }
+        });
+        let mut base = authenticated_http_test_client(format!("http://{address}/responses"));
+        base.rotate_helper = Ok(Some(fixture.helper.clone()));
+        let original_owner = ConversationIdentity::Main(uuid::Uuid::new_v4().to_string());
+        let mut request = buffered_test_request();
+        request.input = serde_json::from_value(serde_json::json!([
+            {"type":"reasoning","id":"rs_1","encrypted_content":"opaque-reasoning","summary":[]},
+            {"type":"function_call_output","call_id":"call_1","output":"completed-tool-result"}
+        ]))
+        .unwrap();
+        for (account, epoch) in [("a", 20), ("b", 21)] {
+            fixture.respond(snapshot(account, epoch, 1));
+            let bound = base.for_request(&request.model).await.unwrap();
+            let (owner, _) = bound.scope_context(Some(&original_owner), None);
+            let continuation = super::super::continuation::continuation_candidate_for_owner(
+                owner.as_ref(),
+                &request,
+                true,
+            );
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                bound.post_codex_with_transport(
+                    &request,
+                    &http_test_context(),
+                    Some(&continuation),
+                    crate::config::CodexTransport::WebSocket,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(response.socket_id.is_some());
+            super::super::continuation::record_continuation_for_owner(
+                &continuation,
+                &request,
+                Some(&format!("resp-{account}")),
+                response.socket_id,
+                &[],
+            );
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotate_invalid_helper_never_falls_back_to_private_auth() {
+        let mut client = authenticated_http_test_client("http://127.0.0.1:9/responses".to_owned());
+        client.rotate_helper = Err("Invalid Codex rotate helper configuration".to_owned());
+        let error = client
+            .post_native_responses(&serde_json::json!({}), &http_test_context(), false, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.origin, CodexErrorOrigin::Auth);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("Invalid Codex rotate helper configuration")
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_native_responses_is_rejected_before_helper_or_transport() {
+        let mut client = authenticated_http_test_client("http://127.0.0.1:9/responses".to_owned());
+        client.rotate_helper = Ok(Some(RotateHelper::new(vec![
+            "/missing-helper-must-not-run".to_owned(),
+        ])));
+        let error = client
+            .post_native_responses(
+                &serde_json::json!({"previous_response_id": "account-a-response"}),
+                &http_test_context(),
+                false,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("use /v1/messages"));
+    }
+
+    #[tokio::test]
+    async fn rotate_live_stream_never_refreshes_or_replays_after_semantic_output() {
+        use super::super::rotate::tests::{Fixture, snapshot};
+        let fixture = Fixture::new(snapshot("a", 30, 1));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_websocket_json(&mut websocket).await;
+            for event in [
+                serde_json::json!({"type":"response.output_text.delta","output_index":0,"delta":"one visible result"}),
+                serde_json::json!({"type":"error","error":{"code":"unauthorized","status":401,"message":"expired"}}),
+            ] {
+                websocket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        event.to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut base = authenticated_http_test_client(format!("http://{address}/responses"));
+        base.rotate_helper = Ok(Some(fixture.helper.clone()));
+        let bound = Arc::new(base.for_request("gpt-5.6-sol").await.unwrap());
+        let mut events = bound
+            .stream_codex_websocket_events_for_owner(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut visible = 0;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+        {
+            if let Ok(event) = event
+                && event["type"] == "response.output_text.delta"
+            {
+                visible += 1;
+            }
+        }
+        assert_eq!(visible, 1);
+        server.await.unwrap();
+        assert_eq!(
+            fixture.requests().len(),
+            1,
+            "no refresh or reacquire after output"
+        );
     }
 
     #[tokio::test]

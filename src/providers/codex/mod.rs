@@ -8,6 +8,8 @@ pub(crate) mod events;
 pub mod images;
 pub mod native;
 pub mod request_summary;
+mod rotate;
+mod rotate_context;
 pub mod search;
 pub mod transcription;
 pub mod translate;
@@ -70,6 +72,7 @@ use self::translate::stream::translate_stream_bytes_with_traffic;
 
 pub(crate) fn clear_session_compaction(session_id: &str) {
     compaction::clear_compaction(session_id);
+    rotate::clear_session_compaction(session_id);
 }
 
 pub struct CodexProvider {
@@ -94,7 +97,7 @@ impl CodexProvider {
     async fn handle_messages_inner(
         &self,
         body: MessagesRequest,
-        ctx: RequestContext,
+        mut ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
@@ -113,7 +116,24 @@ impl CodexProvider {
                 ),
             );
         }
-        if search::is_standalone_search_request(&body) {
+        let standalone_search = search::is_standalone_search_request(&body);
+        let use_responses_lite = if standalone_search {
+            false
+        } else {
+            apply_model_lane_for_request(&mut resolved.model, &body)
+        };
+        // Keep `body` as the original MessagesRequest. Acquire once before
+        // translation, compaction substitution or continuation reservation.
+        let client = match self.client.for_request(&resolved.model).await {
+            Ok(client) => Arc::new(client),
+            Err(error) => return map_codex_error_to_response(&error),
+        };
+        let replay_marker =
+            client.replay_marker(conversation_identity.as_ref(), ctx.session_id.as_deref());
+        let (conversation_identity, scoped_session) =
+            client.scope_context(conversation_identity.as_ref(), ctx.session_id.as_deref());
+        ctx.session_id = scoped_session;
+        if standalone_search {
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.model_resolved(&ctx.req_id, &resolved.model);
             }
@@ -144,7 +164,7 @@ impl CodexProvider {
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.upstream_started(&ctx.req_id);
             }
-            let search_response = match self.client.post_search(&search_request, &ctx).await {
+            let search_response = match client.post_search(&search_request, &ctx).await {
                 Ok(response) => response,
                 Err(error) => {
                     log.warn(
@@ -192,7 +212,6 @@ impl CodexProvider {
                 ctx.traffic.as_deref(),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -219,6 +238,34 @@ impl CodexProvider {
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = config::codex_server_compaction();
         let mut compaction_attempt = None;
+        let replay_required = match replay_marker
+            .as_ref()
+            .map(rotate_context::ReplayMarker::required)
+            .transpose()
+        {
+            Ok(required) => required.unwrap_or(false),
+            Err(error) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    error.to_string(),
+                );
+            }
+        };
+        if replay_required {
+            let replay = server_compaction_enabled
+                .then(|| apply_compaction_replay(ctx.session_id.as_deref(), &translated))
+                .flatten();
+            let Some(replay) = replay else {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    rotate_context::RECOVERY_ERROR,
+                );
+            };
+            translated = replay.request;
+            compaction_attempt = Some(replay.attempt);
+        }
         if !server_compaction_enabled && let Some(session_id) = ctx.session_id.as_deref() {
             compaction::clear_compaction(session_id);
         }
@@ -226,6 +273,15 @@ impl CodexProvider {
             && compact_boundary
             && let Some(session_id) = ctx.session_id.as_deref()
         {
+            if let Some(marker) = replay_marker.as_ref()
+                && let Err(error) = marker.require()
+            {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    error.to_string(),
+                );
+            }
             let attempt = begin_compaction(session_id, &translated.model);
             compaction_attempt = Some(attempt);
             log_compaction_event(
@@ -239,7 +295,7 @@ impl CodexProvider {
             }
             let mut compaction_ctx = ctx.clone();
             compaction_ctx.monitor = None;
-            match request_compaction(self.client.as_ref(), &translated, &compaction_ctx).await {
+            match request_compaction(client.as_ref(), &translated, &compaction_ctx).await {
                 Ok(native_history) => {
                     if store_compaction(session_id, attempt, native_history) {
                         log_compaction_event(
@@ -277,12 +333,17 @@ impl CodexProvider {
                     );
                 }
             }
-        } else if server_compaction_enabled
-            && !compact_boundary
-            && let Some(replay) = apply_compaction_replay(ctx.session_id.as_deref(), &translated)
-        {
-            translated = replay.request;
-            compaction_attempt = Some(replay.attempt);
+        } else if server_compaction_enabled && !compact_boundary && !replay_required {
+            if let Some(replay) = apply_compaction_replay(ctx.session_id.as_deref(), &translated) {
+                translated = replay.request;
+                compaction_attempt = Some(replay.attempt);
+            } else if compaction::has_required_compaction(ctx.session_id.as_deref()) {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "Rotated compacted context cannot be replayed from this request; restore full conversation context before retrying",
+                );
+            }
         }
 
         // Check continuation
@@ -291,7 +352,8 @@ impl CodexProvider {
             conversation_identity.as_ref(),
             &translated,
             previous_response_id_enabled,
-        );
+        )
+        .with_reasoning_provenance(client.reasoning_provenance());
         let turn_id = continuation.turn_id();
         let configured_transport = config::codex_transport();
         let transport = configured_transport.as_str();
@@ -326,7 +388,6 @@ impl CodexProvider {
         );
 
         // Post to upstream with continuation
-        let client = self.client.clone();
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
@@ -490,7 +551,13 @@ impl CodexProvider {
                 model,
                 ctx.traffic.as_deref(),
             ) {
-                Ok(json) => {
+                Ok(mut json) => {
+                    if let Some(provenance) = client.reasoning_provenance() {
+                        translate::reasoning_signature::annotate_response_signatures(
+                            &mut json,
+                            &provenance,
+                        );
+                    }
                     if let Some(monitor) = ctx.monitor.as_ref() {
                         monitor.usage_updated(
                             &ctx.req_id,
@@ -867,7 +934,8 @@ async fn live_stream_response_once(
         message_id,
         model.to_string(),
         estimated_input_tokens,
-    );
+    )
+    .with_reasoning_provenance(request_continuation.reasoning_provenance());
     let mut upstream_sse_body = Vec::new();
     // Keep protocol framing private until real output makes a transparent retry unsafe.
     // Every branch that consumes pending_chunk returns, so it is never flushed twice.
