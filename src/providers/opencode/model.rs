@@ -200,6 +200,35 @@ pub const MODELS: &[ModelSpec] = &[
     },
 ];
 
+/// A model a gateway can serve, with the wire protocol its upstream speaks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub id: String,
+    pub endpoint: EndpointKind,
+}
+
+/// The model table of one OpenAI/Anthropic-compatible gateway. OpenCode Go
+/// ships a compiled-in table; other gateways may load theirs at runtime.
+pub trait ModelCatalog: Send + Sync {
+    fn resolve(&self, raw: &str) -> Option<ResolvedModel>;
+    fn advertised_models(&self) -> Vec<String>;
+}
+
+pub struct OpenCodeGoCatalog;
+
+impl ModelCatalog for OpenCodeGoCatalog {
+    fn resolve(&self, raw: &str) -> Option<ResolvedModel> {
+        resolve(raw).map(|spec| ResolvedModel {
+            id: spec.id.to_string(),
+            endpoint: spec.endpoint,
+        })
+    }
+
+    fn advertised_models(&self) -> Vec<String> {
+        advertised_models()
+    }
+}
+
 pub fn resolve(raw: &str) -> Option<ModelSpec> {
     let id = raw.strip_prefix(MODEL_PREFIX).unwrap_or(raw);
     MODELS.iter().copied().find(|model| model.id == id)

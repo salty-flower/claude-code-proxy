@@ -5,18 +5,21 @@ use futures_util::StreamExt;
 use http::StatusCode;
 use serde::Serialize;
 
+use super::gateway::{Gateway, OPENCODE_GO};
 use super::model::EndpointKind;
 use crate::traffic::TrafficCapture;
 
 const MAX_BUFFERED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct OpenCodeClient {
+    gateway: &'static Gateway,
     client: Arc<reqwest::Client>,
     base_url: reqwest::Url,
     api_key: Option<String>,
 }
 
 pub struct OpenCodeResponse {
+    gateway: &'static Gateway,
     response: reqwest::Response,
 }
 
@@ -31,16 +34,18 @@ impl OpenCodeResponse {
     pub fn into_stream(
         self,
     ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, OpenCodeError>> + Send {
-        self.response.bytes_stream().map(|chunk| {
+        let label = self.gateway.label;
+        self.response.bytes_stream().map(move |chunk| {
             chunk.map_err(|_| OpenCodeError {
                 status: StatusCode::BAD_GATEWAY,
                 retry_after: None,
-                message: "OpenCode Go upstream stream failed".to_string(),
+                message: format!("{label} upstream stream failed"),
             })
         })
     }
 
     pub async fn into_bytes(self) -> Result<Vec<u8>, OpenCodeError> {
+        let label = self.gateway.label;
         let mut stream = self.into_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
@@ -49,7 +54,7 @@ impl OpenCodeResponse {
                 return Err(OpenCodeError {
                     status: StatusCode::BAD_GATEWAY,
                     retry_after: None,
-                    message: "OpenCode Go upstream response exceeds the size limit".to_string(),
+                    message: format!("{label} upstream response exceeds the size limit"),
                 });
             }
             bytes.extend_from_slice(&chunk);
@@ -60,12 +65,21 @@ impl OpenCodeResponse {
 
 impl OpenCodeClient {
     pub fn new(base_url: String, api_key: Option<String>) -> anyhow::Result<Self> {
+        Self::for_gateway(&OPENCODE_GO, base_url, api_key)
+    }
+
+    pub fn for_gateway(
+        gateway: &'static Gateway,
+        base_url: String,
+        api_key: Option<String>,
+    ) -> anyhow::Result<Self> {
         let base_url = reqwest::Url::parse(base_url.trim_end_matches('/'))?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .build()?;
         Ok(Self {
+            gateway,
             client: Arc::new(client),
             base_url,
             api_key,
@@ -84,7 +98,10 @@ impl OpenCodeClient {
             return Err(OpenCodeError {
                 status: StatusCode::UNAUTHORIZED,
                 retry_after: None,
-                message: "OpenCode Go API key is not configured; set CCP_OPENCODE_API_KEY, OPENCODE_API_KEY, or opencode.apiKey in config.json".to_string(),
+                message: format!(
+                    "{} API key is not configured; {}",
+                    self.gateway.label, self.gateway.key_hint
+                ),
             });
         };
         let url = self.endpoint_url(endpoint);
@@ -106,19 +123,22 @@ impl OpenCodeClient {
                 EndpointKind::ChatCompletions | EndpointKind::Responses => "authorization",
                 EndpointKind::Messages => "x-api-key",
             };
+            let mut recorded_headers = serde_json::json!({
+                "accept": accept,
+                auth_header: "[redacted]",
+                "content-type": "application/json"
+            });
+            if let Some(name) = self.gateway.session_header {
+                recorded_headers[name] = serde_json::Value::String(session_header_value.clone());
+            }
             capture.write_json(
                 "021-upstream-request-metadata",
                 &serde_json::json!({
                     "method": "POST",
                     "url": url.as_str(),
-                    "provider": "opencode",
+                    "provider": self.gateway.provider,
                     "transport": "http",
-                    "headers": {
-                        "accept": accept,
-                        auth_header: "[redacted]",
-                        "content-type": "application/json",
-                        "x-opencode-session": session_header_value
-                    }
+                    "headers": recorded_headers
                 }),
             );
         }
@@ -128,8 +148,10 @@ impl OpenCodeClient {
             .post(url)
             .header(http::header::ACCEPT, accept)
             .header(http::header::CONTENT_TYPE, "application/json")
-            .header("x-opencode-session", &session_header_value)
             .json(body);
+        if let Some(name) = self.gateway.session_header {
+            request = request.header(name, &session_header_value);
+        }
         match endpoint {
             EndpointKind::ChatCompletions | EndpointKind::Responses => {
                 request = request.header(http::header::AUTHORIZATION, format!("Bearer {api_key}"));
@@ -143,7 +165,7 @@ impl OpenCodeClient {
         let response = request.send().await.map_err(|_| OpenCodeError {
             status: StatusCode::BAD_GATEWAY,
             retry_after: None,
-            message: "OpenCode Go upstream request failed".to_string(),
+            message: format!("{} upstream request failed", self.gateway.label),
         })?;
 
         if let Some(capture) = traffic.as_ref() {
@@ -157,9 +179,12 @@ impl OpenCodeClient {
         }
 
         if !response.status().is_success() {
-            return Err(rejected_response(response).await);
+            return Err(rejected_response(self.gateway, response).await);
         }
-        Ok(OpenCodeResponse { response })
+        Ok(OpenCodeResponse {
+            gateway: self.gateway,
+            response,
+        })
     }
 
     fn endpoint_url(&self, endpoint: EndpointKind) -> reqwest::Url {
@@ -175,7 +200,7 @@ impl OpenCodeClient {
     }
 }
 
-async fn rejected_response(response: reqwest::Response) -> OpenCodeError {
+async fn rejected_response(gateway: &Gateway, response: reqwest::Response) -> OpenCodeError {
     let status = response.status();
     let retry_after = response
         .headers()
@@ -204,7 +229,7 @@ async fn rejected_response(response: reqwest::Response) -> OpenCodeError {
                 .map(str::to_string)
         })
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("OpenCode Go upstream returned HTTP {status}"));
+        .unwrap_or_else(|| format!("{} upstream returned HTTP {status}", gateway.label));
     OpenCodeError {
         status,
         retry_after,
