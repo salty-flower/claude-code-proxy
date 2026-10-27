@@ -1579,3 +1579,174 @@ async fn models_endpoint_tolerates_unknown_query_params() {
     let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
     assert_eq!(status, StatusCode::OK);
 }
+
+/// Answers every request with a fixed status and records the model it saw.
+struct StatusProvider {
+    name: &'static str,
+    models: Vec<String>,
+    status: StatusCode,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Provider for StatusProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        self.models.clone()
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(body.model.unwrap_or_default());
+        (self.status, self.name).into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(body.model.unwrap_or_default());
+        (self.status, self.name).into_response()
+    }
+}
+
+struct FallbackFixture {
+    app: axum::Router,
+    primary_seen: Arc<Mutex<Vec<String>>>,
+    substitute_seen: Arc<Mutex<Vec<String>>>,
+}
+
+fn fallback_fixture(primary_status: StatusCode, fallbacks: &str) -> FallbackFixture {
+    let primary_seen = Arc::new(Mutex::new(Vec::new()));
+    let substitute_seen = Arc::new(Mutex::new(Vec::new()));
+    let registry = Registry::from_providers(
+        AliasProvider::Codex,
+        vec![
+            Arc::new(StatusProvider {
+                name: "opencode",
+                models: vec![
+                    "opencode-go/glm-5.3".to_string(),
+                    "opencode-go/kimi-k3".to_string(),
+                ],
+                status: primary_status,
+                seen: primary_seen.clone(),
+            }) as Arc<dyn Provider>,
+            Arc::new(StatusProvider {
+                name: "commandcode",
+                models: vec!["commandcode/zai-org/GLM-5.3".to_string()],
+                status: StatusCode::OK,
+                seen: substitute_seen.clone(),
+            }),
+        ],
+    )
+    .with_fallbacks(claude_code_proxy::fallback::FallbackMap::from_json(fallbacks).unwrap());
+    FallbackFixture {
+        app: app(Arc::new(registry)),
+        primary_seen,
+        substitute_seen,
+    }
+}
+
+async fn post_messages(app: &axum::Router, path: &str, model: &str) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": model,
+                        "max_tokens": 16,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+const GLM_FALLBACK: &str = r#"{"opencode-go/glm-5.3": "commandcode/zai-org/GLM-5.3"}"#;
+
+#[tokio::test]
+async fn quota_rejection_is_retried_once_on_the_configured_substitute() {
+    for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::PAYMENT_REQUIRED] {
+        let fixture = fallback_fixture(status, GLM_FALLBACK);
+        let (status, body) =
+            post_messages(&fixture.app, "/v1/messages", "opencode-go/glm-5.3").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "commandcode");
+        assert_eq!(
+            *fixture.primary_seen.lock().unwrap(),
+            ["opencode-go/glm-5.3"]
+        );
+        assert_eq!(
+            *fixture.substitute_seen.lock().unwrap(),
+            ["commandcode/zai-org/GLM-5.3"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_quota_rejections_and_unmapped_models_are_not_retried() {
+    let fixture = fallback_fixture(StatusCode::UNAUTHORIZED, GLM_FALLBACK);
+    let (status, _) = post_messages(&fixture.app, "/v1/messages", "opencode-go/glm-5.3").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(fixture.substitute_seen.lock().unwrap().is_empty());
+
+    let fixture = fallback_fixture(StatusCode::TOO_MANY_REQUESTS, GLM_FALLBACK);
+    let (status, body) = post_messages(&fixture.app, "/v1/messages", "opencode-go/kimi-k3").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(body.contains("opencode"));
+    assert!(fixture.substitute_seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unroutable_fallback_target_returns_the_original_rejection() {
+    let fixture = fallback_fixture(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"opencode-go/glm-5.3": "commandcode/not-listed"}"#,
+    );
+    let (status, body) = post_messages(&fixture.app, "/v1/messages", "opencode-go/glm-5.3").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(body.contains("opencode"));
+    assert!(fixture.substitute_seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn count_tokens_never_falls_back() {
+    let fixture = fallback_fixture(StatusCode::TOO_MANY_REQUESTS, GLM_FALLBACK);
+    let (status, _) = post_messages(
+        &fixture.app,
+        "/v1/messages/count_tokens",
+        "opencode-go/glm-5.3",
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(fixture.substitute_seen.lock().unwrap().is_empty());
+}

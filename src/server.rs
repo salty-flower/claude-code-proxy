@@ -8,7 +8,7 @@ use crate::{
         stream::openai_response as render_openai_response,
     },
     project,
-    provider::RequestContext,
+    provider::{Provider, RequestContext},
     providers::codex::{
         chat_completions::{ChatCompletionsBackend, request::translate_request},
         images::{
@@ -1764,6 +1764,13 @@ async fn dispatch_request(
         monitor: state.monitor.clone(),
     };
 
+    // The substitute needs its own copy of the request, so take one only when
+    // this model has a fallback configured.
+    let fallback = (!count_tokens)
+        .then(|| state.registry.fallback_for(&normalized_model))
+        .flatten()
+        .map(|target| (target.to_string(), body.clone(), context.clone()));
+
     let response = if count_tokens {
         provider.handle_count_tokens(body, context).await
     } else {
@@ -1778,6 +1785,25 @@ async fn dispatch_request(
                 },
             )
             .await
+    };
+    let (response, provider, normalized_model) = match fallback {
+        Some((target, body, context)) if crate::fallback::is_fallback_status(response.status()) => {
+            run_fallback(
+                &state,
+                &log,
+                FallbackAttempt {
+                    req_id: &req_id,
+                    rejected: response,
+                    provider,
+                    model: normalized_model,
+                    target,
+                    body,
+                    context,
+                },
+            )
+            .await
+        }
+        _ => (response, provider, normalized_model),
     };
     log_request_completed(
         &log,
@@ -1823,6 +1849,65 @@ async fn dispatch_request(
         );
     }
     with_request_id(response, &req_id)
+}
+
+struct FallbackAttempt<'a> {
+    req_id: &'a str,
+    rejected: Response,
+    provider: Arc<dyn Provider>,
+    model: String,
+    target: String,
+    body: crate::anthropic::schema::MessagesRequest,
+    context: RequestContext,
+}
+
+/// Retry a quota-rejected request once on its configured substitute. The
+/// rejection is returned unchanged when the substitute is not routable, so a
+/// stale fallback map degrades to the original error instead of a new one.
+async fn run_fallback(
+    state: &AppState,
+    log: &Logger,
+    attempt: FallbackAttempt<'_>,
+) -> (Response, Arc<dyn Provider>, String) {
+    let FallbackAttempt {
+        req_id,
+        rejected,
+        provider,
+        model,
+        target,
+        mut body,
+        mut context,
+    } = attempt;
+    let status = rejected.status();
+    let Some(substitute) = state.registry.provider_for_model(&target, None) else {
+        log.warn(
+            "model fallback target is not routable",
+            Some(Map::from_iter([
+                ("reqId".to_string(), json!(req_id)),
+                ("model".to_string(), json!(&model)),
+                ("target".to_string(), json!(&target)),
+            ])),
+        );
+        return (rejected, provider, model);
+    };
+    log.warn(
+        "model fallback",
+        Some(Map::from_iter([
+            ("reqId".to_string(), json!(req_id)),
+            ("status".to_string(), json!(status.as_u16())),
+            ("fromProvider".to_string(), json!(provider.name())),
+            ("fromModel".to_string(), json!(&model)),
+            ("toProvider".to_string(), json!(substitute.name())),
+            ("toModel".to_string(), json!(&target)),
+        ])),
+    );
+    if let Some(monitor) = state.monitor.as_ref() {
+        monitor.provider_selected(req_id, substitute.name(), &target, None);
+    }
+    body.model = Some(target.clone());
+    context.provider = substitute.name().to_string();
+    let response = substitute.handle_messages(body, context).await;
+    (response, substitute, target)
 }
 
 /// Header Claude Code reads to populate the `requestId` field it writes into
