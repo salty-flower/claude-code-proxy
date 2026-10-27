@@ -932,6 +932,70 @@ pub fn codex_header_timeout_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Codex appended instructions (CCP_CODEX_APPEND_INSTRUCTIONS_FILE)
+// ---------------------------------------------------------------------------
+
+/// Operator text appended to the instructions of every Codex-provider
+/// Messages request, read once from the file
+/// `CCP_CODEX_APPEND_INSTRUCTIONS_FILE` names.
+///
+/// The file is read on first use, which `serve` forces at startup, so an
+/// unreadable path warns once there and the proxy keeps serving without it.
+/// An unset or empty variable, or a file holding only whitespace, appends
+/// nothing.
+pub fn codex_append_instructions() -> Option<&'static str> {
+    static TEXT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        let path = std::env::var_os("CCP_CODEX_APPEND_INSTRUCTIONS_FILE");
+        let log = crate::logging::create_logger("codex");
+        match read_codex_append_instructions(path.as_deref()) {
+            Ok(text) => {
+                if let (Some(path), Some(text)) = (path.as_ref(), text.as_ref()) {
+                    log.info(
+                        "codex appended instructions loaded",
+                        Some(serde_json::Map::from_iter([
+                            (
+                                "path".to_string(),
+                                serde_json::json!(path.to_string_lossy()),
+                            ),
+                            ("bytes".to_string(), serde_json::json!(text.len())),
+                        ])),
+                    );
+                }
+                text
+            }
+            Err(error) => {
+                log.warn(
+                    "could not read CCP_CODEX_APPEND_INSTRUCTIONS_FILE; appending nothing",
+                    Some(serde_json::Map::from_iter([
+                        (
+                            "path".to_string(),
+                            serde_json::json!(
+                                path.as_deref().map(std::ffi::OsStr::to_string_lossy)
+                            ),
+                        ),
+                        ("error".to_string(), serde_json::json!(error.to_string())),
+                    ])),
+                );
+                None
+            }
+        }
+    })
+    .as_deref()
+}
+
+fn read_codex_append_instructions(
+    path: Option<&std::ffi::OsStr>,
+) -> std::io::Result<Option<String>> {
+    let Some(path) = path.filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    let text = fs::read_to_string(path)?;
+    let text = text.trim();
+    Ok((!text.is_empty()).then(|| text.to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // Cursor config
 // ---------------------------------------------------------------------------
 
@@ -1426,5 +1490,32 @@ mod tests {
         assert!(codex_server_compaction());
         let _disabled_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "false");
         assert!(!codex_server_compaction());
+    }
+
+    #[test]
+    fn codex_append_instructions_file_reads_trimmed_text_or_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("steering.md");
+
+        assert_eq!(read_codex_append_instructions(None).unwrap(), None);
+        assert_eq!(
+            read_codex_append_instructions(Some(std::ffi::OsStr::new(""))).unwrap(),
+            None
+        );
+        assert!(read_codex_append_instructions(Some(path.as_os_str())).is_err());
+
+        std::fs::write(&path, " \n\t\n").unwrap();
+        assert_eq!(
+            read_codex_append_instructions(Some(path.as_os_str())).unwrap(),
+            None
+        );
+
+        std::fs::write(&path, "# Steering\n\nBe terse.\n").unwrap();
+        assert_eq!(
+            read_codex_append_instructions(Some(path.as_os_str()))
+                .unwrap()
+                .as_deref(),
+            Some("# Steering\n\nBe terse.")
+        );
     }
 }

@@ -459,11 +459,14 @@ pub fn has_hosted_web_search(req: &MessagesRequest) -> bool {
         })
 }
 
+/// Codex-provider entry point. Only this path appends the operator's
+/// `CCP_CODEX_APPEND_INSTRUCTIONS_FILE` text; the OpenAI-compatible entry
+/// below serves other providers and never sees it.
 pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
-    translate_request_inner(req, opts, true)
+    translate_request_inner(req, opts, true, config::codex_append_instructions())
 }
 
 pub fn translate_openai_compatible_request(
@@ -480,16 +483,35 @@ pub fn translate_openai_compatible_request(
             use_responses_lite: false,
         },
         false,
+        None,
     )
+}
+
+/// Appends `appended` after the caller's system text, separated by a blank
+/// line. With no system text the appended text alone becomes the
+/// instructions.
+fn append_instructions(instructions: Option<String>, appended: Option<&str>) -> Option<String> {
+    let Some(appended) = appended.filter(|text| !text.is_empty()) else {
+        return instructions;
+    };
+    Some(match instructions {
+        Some(base) if !base.is_empty() => format!("{base}\n\n{appended}"),
+        _ => appended.to_string(),
+    })
 }
 
 fn translate_request_inner(
     req: &MessagesRequest,
     opts: TranslateOptions,
     apply_codex_config: bool,
+    appended_instructions: Option<&str>,
 ) -> Result<ResponsesRequest, anyhow::Error> {
-    let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
+    // A compaction summary keeps Claude Code's own summarizer prompt intact.
+    let instructions = append_instructions(
+        flatten_system_text(req.extra.get("system")),
+        appended_instructions.filter(|_| !is_compact),
+    );
     let input = build_input(req);
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
@@ -2567,6 +2589,137 @@ mod tests {
         } else {
             panic!("expected developer message");
         }
+    }
+
+    fn lite_opts() -> TranslateOptions {
+        TranslateOptions {
+            model: "gpt-6-luna".to_string(),
+            use_responses_lite: true,
+            ..opts()
+        }
+    }
+
+    fn developer_texts(out: &ResponsesRequest) -> Vec<&str> {
+        out.input
+            .iter()
+            .filter_map(|item| match item {
+                ResponsesInputItem::Message { role, content } if role == "developer" => {
+                    Some(content)
+                }
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|part| match part {
+                ResponsesContentPart::InputText { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn appended_instructions_follow_system_text() {
+        let with_system: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-sol",
+            "messages": [{"role":"user", "content":"hello"}],
+            "system": [{"type":"text","text":"be helpful"},{"type":"text","text":"be brief"}]
+        }))
+        .unwrap();
+        let out = translate_request_inner(&with_system, opts(), true, Some("steer")).unwrap();
+        assert_eq!(
+            out.instructions.as_deref(),
+            Some("be helpful\n\nbe brief\n\nsteer")
+        );
+
+        let without_system: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-sol",
+            "messages": [{"role":"user", "content":"hello"}]
+        }))
+        .unwrap();
+        let out = translate_request_inner(&without_system, opts(), true, Some("steer")).unwrap();
+        assert_eq!(out.instructions.as_deref(), Some("steer"));
+    }
+
+    #[test]
+    fn appended_instructions_ride_the_lite_developer_message() {
+        let with_system: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-luna",
+            "messages": [{"role":"user", "content":"hello"}],
+            "system": "be helpful"
+        }))
+        .unwrap();
+        let out = translate_request_inner(&with_system, lite_opts(), true, Some("steer")).unwrap();
+        assert!(out.instructions.is_none());
+        assert_eq!(developer_texts(&out), ["be helpful\n\nsteer"]);
+
+        let without_system: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-luna",
+            "messages": [{"role":"user", "content":"hello"}]
+        }))
+        .unwrap();
+        let out =
+            translate_request_inner(&without_system, lite_opts(), true, Some("steer")).unwrap();
+        assert!(out.instructions.is_none());
+        assert_eq!(developer_texts(&out), ["steer"]);
+    }
+
+    #[test]
+    fn appended_instructions_skip_compact_requests() {
+        let summarizer = "You are a helpful AI assistant tasked with summarizing conversations.";
+        let by_system: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-sol",
+            "messages": [{"role":"user", "content":"summarize"}],
+            "system": summarizer
+        }))
+        .unwrap();
+        let by_message: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-sol",
+            "messages": [{"role":"user", "content": concat!(
+                "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n",
+                "Your task is to create a detailed summary of the conversation so far."
+            )}],
+            "system": "You are Claude Code."
+        }))
+        .unwrap();
+        for (req, system) in [
+            (&by_system, summarizer),
+            (&by_message, "You are Claude Code."),
+        ] {
+            assert!(is_compact_messages_request(req));
+            let out = translate_request_inner(req, opts(), true, Some("steer")).unwrap();
+            assert_eq!(out.instructions.as_deref(), Some(system));
+            let lite = translate_request_inner(req, lite_opts(), true, Some("steer")).unwrap();
+            assert_eq!(developer_texts(&lite), [system]);
+        }
+    }
+
+    #[test]
+    fn unset_appended_instructions_leave_the_request_unchanged() {
+        let with_system: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-sol",
+            "messages": [{"role":"user", "content":"hello"}],
+            "system": "be helpful"
+        }))
+        .unwrap();
+        let without_system: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-sol",
+            "messages": [{"role":"user", "content":"hello"}]
+        }))
+        .unwrap();
+        for appended in [None, Some("")] {
+            let out = translate_request_inner(&with_system, opts(), true, appended).unwrap();
+            assert_eq!(out.instructions.as_deref(), Some("be helpful"));
+            let out = translate_request_inner(&without_system, opts(), true, appended).unwrap();
+            assert!(out.instructions.is_none());
+            let lite = translate_request_inner(&with_system, lite_opts(), true, appended).unwrap();
+            assert_eq!(developer_texts(&lite), ["be helpful"]);
+            let lite =
+                translate_request_inner(&without_system, lite_opts(), true, appended).unwrap();
+            assert!(developer_texts(&lite).is_empty());
+        }
+        let compatible =
+            translate_openai_compatible_request(&with_system, "gpt-6-luna".to_string(), None)
+                .unwrap();
+        assert_eq!(compatible.instructions.as_deref(), Some("be helpful"));
     }
 
     #[test]

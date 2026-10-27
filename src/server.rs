@@ -167,6 +167,9 @@ pub async fn serve_listener(
             ),
         ])),
     );
+    // Read the Codex instructions file now, so a bad path warns at startup
+    // rather than on the first request.
+    let _ = crate::config::codex_append_instructions();
     let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
     axum::serve(
         listener,
