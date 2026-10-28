@@ -301,6 +301,8 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         out.push("opencode.apiKey (env)".to_string());
     } else if env.contains_key("OPENCODE_API_KEY") {
         out.push("opencode.apiKey (OpenCode env)".to_string());
+    } else if env.contains_key("CCP_OPENCODE_API_KEY_FILE") {
+        out.push("opencode.apiKey (env key file)".to_string());
     }
     if env.contains_key("CCP_OPENCODE_BASE_URL") {
         out.push("opencode.baseUrl (env)".to_string());
@@ -309,6 +311,8 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         out.push("commandcode.apiKey (env)".to_string());
     } else if env.contains_key("CMD_API_KEY") {
         out.push("commandcode.apiKey (Command Code env)".to_string());
+    } else if env.contains_key("CCP_COMMANDCODE_API_KEY_FILE") {
+        out.push("commandcode.apiKey (env key file)".to_string());
     }
     if env.contains_key("CCP_COMMANDCODE_BASE_URL") {
         out.push("commandcode.baseUrl (env)".to_string());
@@ -540,24 +544,40 @@ pub fn grok_search_blocks() -> GrokSearchBlocks {
 }
 
 /// Where one OpenAI/Anthropic-compatible gateway reads its key and base URL:
-/// key variables in precedence order, then config.json, then nothing.
+/// key variables in precedence order, then the file the key-file variable
+/// names, then config.json, then nothing.
+///
+/// The key file keeps the key out of the process environment, which any
+/// same-user process can read on macOS (`kern.procargs2`).
 struct GatewayEnv {
     key_vars: &'static [&'static str],
+    key_file_var: &'static str,
     base_url_var: &'static str,
     default_base_url: &'static str,
 }
 
 const OPENCODE_ENV: GatewayEnv = GatewayEnv {
     key_vars: &["CCP_OPENCODE_API_KEY", "OPENCODE_API_KEY"],
+    key_file_var: "CCP_OPENCODE_API_KEY_FILE",
     base_url_var: "CCP_OPENCODE_BASE_URL",
     default_base_url: "https://opencode.ai/zen/go/v1",
 };
 
 const COMMANDCODE_ENV: GatewayEnv = GatewayEnv {
     key_vars: &["CCP_COMMANDCODE_API_KEY", "CMD_API_KEY"],
+    key_file_var: "CCP_COMMANDCODE_API_KEY_FILE",
     base_url_var: "CCP_COMMANDCODE_BASE_URL",
     default_base_url: "https://api.commandcode.ai/provider/v1",
 };
+
+/// The key in the file `var` names, without its trailing newline. A missing
+/// or empty file counts as no key, so the next source applies.
+fn read_key_file(env: &HashMap<String, String>, var: &str) -> Option<String> {
+    let path = env.get(var).filter(|value| !value.is_empty())?;
+    let key = fs::read_to_string(path).ok()?;
+    let key = key.trim_end_matches(['\r', '\n']);
+    (!key.is_empty()).then(|| key.to_string())
+}
 
 struct ResolvedGatewayConfig {
     api_key: Option<String>,
@@ -580,6 +600,9 @@ fn resolve_gateway_config(
             env.get(*name)
                 .filter(|value| !value.is_empty())
                 .map(|value| (Some(value.clone()), Some(*name)))
+        })
+        .or_else(|| {
+            read_key_file(env, spec.key_file_var).map(|key| (Some(key), Some(spec.key_file_var)))
         })
         .or_else(|| file_key.map(|value| (Some(value.clone()), Some("config.json"))))
         .unwrap_or((None, None));
@@ -1305,6 +1328,57 @@ mod tests {
         assert_eq!(resolved.api_key.as_deref(), Some("ccp-key"));
         assert_eq!(resolved.api_key_source, Some("CCP_COMMANDCODE_API_KEY"));
         assert_eq!(models_file.as_deref(), Some("/env/models.json"));
+    }
+
+    #[test]
+    fn key_file_sits_between_env_keys_and_config() {
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"opencode":{"apiKey":"file-key"},"commandcode":{"apiKey":"file-key"}}"#,
+        )
+        .unwrap();
+        let key_file = config.path().join("key");
+        std::fs::write(&key_file, "secret-key\n").unwrap();
+        let key_file = key_file.to_string_lossy().into_owned();
+        let mut env = HashMap::from([
+            ("CCP_OPENCODE_API_KEY_FILE".to_string(), key_file.clone()),
+            ("CCP_COMMANDCODE_API_KEY_FILE".to_string(), key_file),
+        ]);
+
+        let resolved = resolve_opencode_config(&env, config.path());
+        assert_eq!(resolved.api_key.as_deref(), Some("secret-key"));
+        assert_eq!(resolved.api_key_source, Some("CCP_OPENCODE_API_KEY_FILE"));
+        let (resolved, _) = resolve_commandcode_config(&env, config.path());
+        assert_eq!(resolved.api_key.as_deref(), Some("secret-key"));
+        assert_eq!(
+            resolved.api_key_source,
+            Some("CCP_COMMANDCODE_API_KEY_FILE")
+        );
+
+        env.insert("OPENCODE_API_KEY".into(), "standard-key".into());
+        let resolved = resolve_opencode_config(&env, config.path());
+        assert_eq!(resolved.api_key_source, Some("OPENCODE_API_KEY"));
+    }
+
+    #[test]
+    fn missing_or_empty_key_file_falls_through_to_config() {
+        let config = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"opencode":{"apiKey":"file-key"}}"#,
+        )
+        .unwrap();
+        let empty = config.path().join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        for path in [config.path().join("missing"), empty] {
+            let env = HashMap::from([(
+                "CCP_OPENCODE_API_KEY_FILE".to_string(),
+                path.to_string_lossy().into_owned(),
+            )]);
+            let resolved = resolve_opencode_config(&env, config.path());
+            assert_eq!(resolved.api_key_source, Some("config.json"), "{path:?}");
+        }
     }
 
     #[test]
