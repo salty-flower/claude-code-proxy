@@ -144,6 +144,7 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | --- | --- | --- | --- |
 | `CCP_OPENCODE_API_KEY` | `opencode.apiKey` | unset | OpenCode Go API key; takes precedence over `OPENCODE_API_KEY` and config. |
 | `OPENCODE_API_KEY` | `opencode.apiKey` | unset | Fallback API-key variable accepted by the proxy when the CCP-specific variable is unset. |
+| `CCP_OPENCODE_API_KEY_FILE` | `opencode.apiKey` | unset | Path of a file holding the OpenCode Go API key, read when neither key variable is set; keeps the key out of the process environment. `CCP_COMMANDCODE_API_KEY_FILE` does the same for Command Code. |
 | `CCP_OPENCODE_BASE_URL` | `opencode.baseUrl` | `https://opencode.ai/zen/go/v1` | Changes the OpenCode Go API base URL. |
 
 ## Cursor Agent

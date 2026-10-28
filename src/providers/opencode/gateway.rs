@@ -12,6 +12,6 @@ pub struct Gateway {
 pub static OPENCODE_GO: Gateway = Gateway {
     provider: "opencode",
     label: "OpenCode Go",
-    key_hint: "set CCP_OPENCODE_API_KEY, OPENCODE_API_KEY, or opencode.apiKey in config.json",
+    key_hint: "set CCP_OPENCODE_API_KEY, OPENCODE_API_KEY, CCP_OPENCODE_API_KEY_FILE, or opencode.apiKey in config.json",
     session_header: Some("x-opencode-session"),
 };
