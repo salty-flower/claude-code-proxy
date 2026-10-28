@@ -18,7 +18,7 @@ pub const MODEL_PREFIX: &str = "commandcode/";
 pub static COMMAND_CODE: Gateway = Gateway {
     provider: "commandcode",
     label: "Command Code",
-    key_hint: "set CCP_COMMANDCODE_API_KEY, CMD_API_KEY, or commandcode.apiKey in config.json",
+    key_hint: "set CCP_COMMANDCODE_API_KEY, CMD_API_KEY, CCP_COMMANDCODE_API_KEY_FILE, or commandcode.apiKey in config.json",
     session_header: None,
 };
 

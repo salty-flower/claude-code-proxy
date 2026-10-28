@@ -499,7 +499,7 @@ struct OpenCodeCli;
 impl CliHandlers for OpenCodeCli {
     fn login(&self) -> anyhow::Result<()> {
         anyhow::bail!(
-            "OpenCode Go uses an API key; set CCP_OPENCODE_API_KEY, OPENCODE_API_KEY, or opencode.apiKey in config.json"
+            "OpenCode Go uses an API key; set CCP_OPENCODE_API_KEY, OPENCODE_API_KEY, CCP_OPENCODE_API_KEY_FILE, or opencode.apiKey in config.json"
         )
     }
 
