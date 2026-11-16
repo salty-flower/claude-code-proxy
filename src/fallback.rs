@@ -1,5 +1,5 @@
 //! Model fallback on quota exhaustion: when the upstream for a requested model
-//! rejects it with 429 or 402 before any output, the request is retried once
+//! rejects it with 429, 402, or 403 before any output, the request is retried once
 //! on a configured substitute, usually the same model on another
 //! subscription. The registry owns the map; production reads it from
 //! `CCP_MODEL_FALLBACKS_FILE`.
@@ -46,13 +46,18 @@ impl FallbackMap {
     }
 }
 
-/// Rejections a substitute can cure: a spent quota or a rate limit on this
-/// subscription. Authentication, permission, and request errors would fail
-/// the same way elsewhere or hide a misconfiguration.
+/// Rejections a substitute can cure: a spent quota, a rate limit, or a plan
+/// that no longer covers the model on this subscription. OpenCode Go reports
+/// a spent subscription as 403 `permission_error` ("An active OpenCode Go
+/// subscription is required"), not as 429 or 402, so 403 counts too; it is
+/// safe because only explicitly mapped models fall back and a failing
+/// substitute returns the original rejection. Authentication (401) and
+/// request errors would fail the same way elsewhere or hide a
+/// misconfiguration.
 pub fn is_fallback_status(status: StatusCode) -> bool {
     matches!(
         status,
-        StatusCode::TOO_MANY_REQUESTS | StatusCode::PAYMENT_REQUIRED
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::PAYMENT_REQUIRED | StatusCode::FORBIDDEN
     )
 }
 
@@ -73,12 +78,12 @@ mod tests {
     }
 
     #[test]
-    fn only_quota_and_rate_limit_rejections_fall_back() {
+    fn only_quota_rate_limit_and_plan_rejections_fall_back() {
         assert!(is_fallback_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(is_fallback_status(StatusCode::PAYMENT_REQUIRED));
+        assert!(is_fallback_status(StatusCode::FORBIDDEN));
         for status in [
             StatusCode::UNAUTHORIZED,
-            StatusCode::FORBIDDEN,
             StatusCode::BAD_REQUEST,
             StatusCode::BAD_GATEWAY,
         ] {

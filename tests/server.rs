@@ -1957,7 +1957,11 @@ const GLM_FALLBACK: &str = r#"{"opencode-go/glm-5.3": "commandcode/zai-org/GLM-5
 
 #[tokio::test]
 async fn quota_rejection_is_retried_once_on_the_configured_substitute() {
-    for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::PAYMENT_REQUIRED] {
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::PAYMENT_REQUIRED,
+        StatusCode::FORBIDDEN,
+    ] {
         let fixture = fallback_fixture(status, GLM_FALLBACK);
         let (status, body) =
             post_messages(&fixture.app, "/v1/messages", "opencode-go/glm-5.3").await;
